@@ -84,25 +84,47 @@ jobs:
 
       - name: Authenticate Kaggle
         shell: bash
+        env:
+          VIKKY_KAGGLE_USERNAME: ${{ secrets.KAGGLE1_USERNAME }}
+          VIKKY_KAGGLE_KEY: ${{ secrets.KAGGLE1_KEY }}
         run: |
           set -euo pipefail
 
-          test -n "${KAGGLE_USERNAME}"
-          test -n "${KAGGLE_KEY}"
+          if [ -z "${VIKKY_KAGGLE_USERNAME}" ]; then
+            echo "ERROR: KAGGLE1_USERNAME secret is empty or unavailable."
+            exit 1
+          fi
+
+          if [ -z "${VIKKY_KAGGLE_KEY}" ]; then
+            echo "ERROR: KAGGLE1_KEY secret is empty or unavailable."
+            exit 1
+          fi
+
+          echo "KAGGLE USERNAME: PRESENT"
+          echo "KAGGLE KEY: PRESENT"
+          echo "KAGGLE KEY LENGTH: ${#VIKKY_KAGGLE_KEY}"
 
           mkdir -p "$HOME/.config/kaggle"
           chmod 700 "$HOME/.config/kaggle"
 
           cat > "$HOME/.config/kaggle/kaggle.json" <<EOF
           {
-            "username": "${KAGGLE_USERNAME}",
-            "key": "${KAGGLE_KEY}"
+            "username": "${VIKKY_KAGGLE_USERNAME}",
+            "key": "${VIKKY_KAGGLE_KEY}"
           }
           EOF
 
           chmod 600 "$HOME/.config/kaggle/kaggle.json"
 
-          echo "KAGGLE AUTH CONFIGURED"
+          echo "Testing Kaggle API authentication..."
+
+          if ! kaggle datasets list --max-size 1 >/tmp/kaggle_auth.log 2>&1; then
+            echo "ERROR: Kaggle API authentication failed."
+            cat /tmp/kaggle_auth.log
+            exit 1
+          fi
+
+          echo "KAGGLE API AUTHENTICATION: PASS"
 
       - name: Prepare kernel
         shell: bash
