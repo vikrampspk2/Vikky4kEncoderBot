@@ -1,0 +1,19 @@
+{
+  "providers": [
+    {"name":"Cloudflare R2","type":"s3_compatible","enabled":false},
+    {"name":"Backblaze B2","type":"s3_compatible","enabled":false},
+    {"name":"Wasabi","type":"s3_compatible","enabled":false},
+    {"name":"Google Drive","type":"oauth","enabled":false},
+    {"name":"Microsoft OneDrive","type":"oauth","enabled":false},
+    {"name":"Amazon S3","type":"s3","enabled":false},
+    {"name":"Azure Blob","type":"azure","enabled":false},
+    {"name":"Google Cloud Storage","type":"gcs","enabled":false},
+    {"name":"DigitalOcean Spaces","type":"s3_compatible","enabled":false},
+    {"name":"Cloudinary","type":"api","enabled":false},
+    {"name":"Pixeldrain","type":"api","enabled":false},
+    {"name":"Dropbox","type":"oauth","enabled":false},
+    {"name":"Box","type":"oauth","enabled":false},
+    {"name":"pCloud","type":"api","enabled":false},
+    {"name":"Filebase","type":"s3_compatible","enabled":false}
+  ]
+}

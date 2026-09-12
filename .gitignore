@@ -1,0 +1,17 @@
+.env
+*.db
+__pycache__/
+config/vikky.db
+logs/*.json
+temp/*
+outputs/*
+!temp/.gitkeep
+!outputs/.gitkeep
+.env
+config/vikky.db
+config/payment/fampay_qr.png
+config/payment_proofs/
+logs/
+temp/
+outputs/
+__pycache__/

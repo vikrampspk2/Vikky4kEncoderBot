@@ -1,0 +1,15 @@
+[Unit]
+Description=VIKKY Encoder Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vikky
+EnvironmentFile=/opt/vikky/.env
+ExecStart=/opt/vikky/.venv/bin/python /opt/vikky/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

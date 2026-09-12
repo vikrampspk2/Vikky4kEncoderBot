@@ -1,0 +1,1 @@
+The player template is a browser embed starting point. Browser playback of MKV is not universal; if browser playback is required, test the actual browser/device codec support or publish a compatible derivative separately. The bot's canonical final remains MKV-only.
