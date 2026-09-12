@@ -1,3 +1,16 @@
+import subprocess
+import sys
+
+def install_deps():
+    reqs = ["torchvision", "basicsr", "facexlib", "gfpgan", "realesrgan", "ffmpeg-python"]
+    for pkg in reqs:
+        try:
+            __import__(pkg)
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=False)
+
+install_deps()
+
 import os
 import sys
 import json
