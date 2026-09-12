@@ -1,0 +1,156 @@
+name: VIKKY Kaggle GPU Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "AI processing mode"
+        required: true
+        default: "4K_AI"
+        type: choice
+        options:
+          - 2K_AI
+          - 4K_AI
+          - 8K_AI
+          - 4K_HYBRID
+          - 8K_HYBRID
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vikky-kaggle-worker
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate worker files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f cloud/kaggle_worker/main.py
+          test -f cloud/kaggle_worker/requirements.txt
+          test -f cloud/kaggle_worker/kernel-metadata.json
+
+          python -m py_compile cloud/kaggle_worker/main.py
+
+          echo "VIKKY WORKER VALIDATION: PASS"
+
+      - name: Secret safety scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -RInE \
+            '(api[_-]?key|bot[_-]?token|password|secret)[[:space:]]*=[[:space:]]*["'\''][A-Za-z0-9_./:+=-]{12,}["'\'']' \
+            app cloud .github \
+            --exclude-dir=.git \
+            --exclude='*.pyc'; then
+              echo "Possible hardcoded secret detected."
+              exit 1
+          fi
+
+          echo "SECRET SAFETY: PASS"
+
+  kaggle:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      VIKKY_MODE: ${{ inputs.mode }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install kaggle
+          kaggle --version
+
+      - name: Authenticate Kaggle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "${KAGGLE_USERNAME}"
+          test -n "${KAGGLE_KEY}"
+
+          mkdir -p "$HOME/.config/kaggle"
+          chmod 700 "$HOME/.config/kaggle"
+
+          cat > "$HOME/.config/kaggle/kaggle.json" <<EOF
+          {
+            "username": "${KAGGLE_USERNAME}",
+            "key": "${KAGGLE_KEY}"
+          }
+          EOF
+
+          chmod 600 "$HOME/.config/kaggle/kaggle.json"
+
+          echo "KAGGLE AUTH CONFIGURED"
+
+      - name: Prepare kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/vikky_kernel
+
+          cp cloud/kaggle_worker/main.py \
+             /tmp/vikky_kernel/main.py
+
+          cp cloud/kaggle_worker/requirements.txt \
+             /tmp/vikky_kernel/requirements.txt
+
+          cp cloud/kaggle_worker/kernel-metadata.json \
+             /tmp/vikky_kernel/kernel-metadata.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("/tmp/vikky_kernel/kernel-metadata.json")
+          data = json.loads(p.read_text())
+
+          data["code_file"] = "main.py"
+          data["language"] = "python"
+          data["kernel_type"] = "script"
+          data["is_private"] = True
+          data["enable_gpu"] = True
+          data["enable_internet"] = True
+
+          p.write_text(json.dumps(data, indent=2) + "\n")
+          print("KERNEL METADATA: VALID")
+          PY
+
+      - name: Push Kaggle kernel
+        working-directory: /tmp/vikky_kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kaggle kernels push
+
+          echo "KAGGLE KERNEL SUBMITTED"
+
+      - name: Submission result
+        shell: bash
+        run: |
+          echo "VIKKY GPU WORKER SUBMISSION COMPLETE"
+          echo "MODE: ${VIKKY_MODE}"
+          echo "The Kaggle kernel now performs the actual cloud-side execution."
