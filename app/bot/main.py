@@ -41,36 +41,69 @@ def is_owner(user_id: int) -> bool:
     return user_id in OWNER_IDS
 
 
+def has_access(user_id: int) -> bool:
+    if is_owner(user_id):
+        return True
+    return access_store.has_active_access(user_id)
+
+
 # =========================================================
-# KEYBOARDS
+# MENUS
 # =========================================================
 
 def owner_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎯 ENCODING", callback_data="owner_encoding"),
+            InlineKeyboardButton(
+                "🎯 ENCODING",
+                callback_data="owner_encoding",
+            ),
         ],
         [
-            InlineKeyboardButton("✨ AI UPSCALE", callback_data="owner_upscale"),
+            InlineKeyboardButton(
+                "✨ AI UPSCALE",
+                callback_data="owner_upscale",
+            ),
         ],
         [
-            InlineKeyboardButton("💎 HYBRID REMASTER", callback_data="owner_hybrid"),
+            InlineKeyboardButton(
+                "💎 HYBRID REMASTER",
+                callback_data="owner_hybrid",
+            ),
         ],
         [
-            InlineKeyboardButton("👥 USERS", callback_data="owner_users"),
-            InlineKeyboardButton("📤 UPLOADERS", callback_data="owner_uploaders"),
+            InlineKeyboardButton(
+                "👥 USERS",
+                callback_data="owner_users",
+            ),
+            InlineKeyboardButton(
+                "📤 UPLOADERS",
+                callback_data="owner_uploaders",
+            ),
         ],
         [
-            InlineKeyboardButton("💳 PAYMENTS", callback_data="owner_payments"),
+            InlineKeyboardButton(
+                "💳 PAYMENTS",
+                callback_data="owner_payments",
+            ),
         ],
         [
-            InlineKeyboardButton("☁️ UPLOAD HOSTS", callback_data="owner_hosts"),
+            InlineKeyboardButton(
+                "☁️ UPLOAD HOSTS",
+                callback_data="owner_hosts",
+            ),
         ],
         [
-            InlineKeyboardButton("📊 JOBS / WORKERS", callback_data="owner_jobs"),
+            InlineKeyboardButton(
+                "📊 JOBS / WORKERS",
+                callback_data="owner_jobs",
+            ),
         ],
         [
-            InlineKeyboardButton("⚙️ SETTINGS", callback_data="owner_settings"),
+            InlineKeyboardButton(
+                "⚙️ SETTINGS",
+                callback_data="owner_settings",
+            ),
         ],
     ])
 
@@ -78,10 +111,16 @@ def owner_menu() -> InlineKeyboardMarkup:
 def locked_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💳 GET ACCESS", callback_data="get_access"),
+            InlineKeyboardButton(
+                "💳 GET ACCESS",
+                callback_data="get_access",
+            ),
         ],
         [
-            InlineKeyboardButton("📞 CONTACT OWNER", callback_data="contact_owner"),
+            InlineKeyboardButton(
+                "📞 CONTACT OWNER",
+                callback_data="contact_owner",
+            ),
         ],
     ])
 
@@ -89,14 +128,45 @@ def locked_menu() -> InlineKeyboardMarkup:
 def processing_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎯 ENCODING", callback_data="user_encoding"),
+            InlineKeyboardButton(
+                "🎯 ENCODING",
+                callback_data="user_encoding",
+            ),
         ],
         [
-            InlineKeyboardButton("✨ AI UPSCALE", callback_data="user_upscale"),
+            InlineKeyboardButton(
+                "✨ AI UPSCALE",
+                callback_data="user_upscale",
+            ),
         ],
         [
-            InlineKeyboardButton("💎 HYBRID REMASTER", callback_data="user_hybrid"),
+            InlineKeyboardButton(
+                "💎 HYBRID REMASTER",
+                callback_data="user_hybrid",
+            ),
         ],
+    ])
+
+
+def back_locked_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "⬅️ BACK",
+                callback_data="back_locked",
+            )
+        ]
+    ])
+
+
+def back_owner_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "⬅️ OWNER MENU",
+                callback_data="back_owner",
+            )
+        ]
     ])
 
 
@@ -104,7 +174,10 @@ def processing_menu() -> InlineKeyboardMarkup:
 # /START
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if update.effective_user is None or update.message is None:
         return
 
@@ -113,103 +186,129 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_owner(user.id):
         await update.message.reply_text(
             "👑 VIKKY Encoder\n\n"
-            "Owner access verified.\n"
+            "✅ Owner access verified.\n"
             "🔐 Secure control mode active.\n\n"
             "Select a control:",
             reply_markup=owner_menu(),
         )
         return
 
-    # Register/update user in the persistent access database.
     access_store.ensure_user(
         user.id,
         username=user.username,
         first_name=user.first_name,
     )
 
-    # Owners always have full access.
-    if access_store.has_active_access(user.id):
+    if has_access(user.id):
         await update.message.reply_text(
-            "🎬 VIKKY Encoder\\n\\n"
-            "✅ Access verified.\\n"
-            "Your processing access is active.\\n\\n"
+            "🎬 VIKKY Encoder\n\n"
+            "✅ Access verified.\n"
+            "Your processing access is active.\n\n"
             "Select a processing mode:",
             reply_markup=processing_menu(),
         )
         return
 
-    # Non-approved users remain locked.
     await update.message.reply_text(
-        "🎬 VIKKY Encoder\\n\\n"
-        "Welcome!\\n\\n"
-        "🔒 Your access is currently locked.\\n"
-        "Processing features are available after owner approval.\\n\\n"
+        "🎬 VIKKY Encoder\n\n"
+        "🔒 Your access is currently locked.\n\n"
+        "Processing features become available after "
+        "owner approval.\n\n"
         "Use the options below:",
         reply_markup=locked_menu(),
     )
 
 
-
 # =========================================================
-# OWNER ACCESS COMMANDS
+# /GRANT
 # =========================================================
 
-async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def grant_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if update.effective_user is None or update.message is None:
         return
 
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Owner-only command.")
+        await update.message.reply_text(
+            "⛔ Owner-only command."
+        )
         return
 
     if not context.args:
         await update.message.reply_text(
-            "Usage:\n/grant USER_ID [DAYS]\n\n"
-            "Example:\n/grant 123456789 30"
+            "Usage:\n"
+            "/grant USER_ID [DAYS]\n\n"
+            "Example:\n"
+            "/grant 123456789 30"
         )
         return
 
     try:
         user_id = int(context.args[0])
-        days = int(context.args[1]) if len(context.args) > 1 else 30
+        days = (
+            int(context.args[1])
+            if len(context.args) > 1
+            else 30
+        )
+
+        if user_id <= 0:
+            raise ValueError
 
         if days <= 0 or days > 3650:
             raise ValueError
 
         access_store.ensure_user(user_id)
-        access_store.approve_user(user_id, days=days)
+        access_store.approve_user(
+            user_id,
+            days=days,
+        )
 
         await update.message.reply_text(
-            f"✅ ACCESS GRANTED\\n\\n"
-            f"User ID: {user_id}\\n"
+            "✅ ACCESS GRANTED\n\n"
+            f"User ID: {user_id}\n"
             f"Duration: {days} days"
         )
 
     except ValueError:
         await update.message.reply_text(
-            "❌ Invalid input.\\n"
+            "❌ Invalid input.\n"
             "Use: /grant USER_ID [DAYS]"
         )
 
 
+# =========================================================
+# /REVOKE
+# =========================================================
 
-async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def revoke_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if update.effective_user is None or update.message is None:
         return
 
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Owner-only command.")
+        await update.message.reply_text(
+            "⛔ Owner-only command."
+        )
         return
 
     if not context.args:
         await update.message.reply_text(
-            "Usage:\n/revoke USER_ID\n\n"
-            "Example:\n/revoke 123456789"
+            "Usage:\n"
+            "/revoke USER_ID\n\n"
+            "Example:\n"
+            "/revoke 123456789"
         )
         return
 
     try:
         user_id = int(context.args[0])
+
+        if user_id <= 0:
+            raise ValueError
 
         if is_owner(user_id):
             await update.message.reply_text(
@@ -221,23 +320,32 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         access_store.revoke_user(user_id)
 
         await update.message.reply_text(
-            f"🔒 ACCESS REVOKED\\n\\n"
+            "🔒 ACCESS REVOKED\n\n"
             f"User ID: {user_id}"
         )
 
     except ValueError:
         await update.message.reply_text(
-            "❌ Invalid user ID.\\n"
+            "❌ Invalid user ID.\n"
             "Use: /revoke USER_ID"
         )
 
 
-async def uploaders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# /UPLOADERS
+# =========================================================
+
+async def uploaders_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if update.effective_user is None or update.message is None:
         return
 
     if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ Owner-only command.")
+        await update.message.reply_text(
+            "⛔ Owner-only command."
+        )
         return
 
     if len(context.args) != 2:
@@ -252,8 +360,12 @@ async def uploaders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         user_id = int(context.args[1])
+        if user_id <= 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
+        await update.message.reply_text(
+            "❌ Invalid user ID."
+        )
         return
 
     if action == "add":
@@ -270,7 +382,7 @@ async def uploaders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await update.message.reply_text(
-            f"📤 UPLOADER ADDED\\n\\n"
+            "📤 UPLOADER ADDED\n\n"
             f"User ID: {user_id}"
         )
         return
@@ -279,19 +391,19 @@ async def uploaders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         access_store.remove_uploader(user_id)
 
         await update.message.reply_text(
-            f"📤 UPLOADER REMOVED\\n\\n"
+            "📤 UPLOADER REMOVED\n\n"
             f"User ID: {user_id}"
         )
         return
 
     await update.message.reply_text(
-        "❌ Unknown action.\\n"
+        "❌ Unknown action.\n"
         "Use: add or remove"
     )
 
 
 # =========================================================
-# CALLBACK SECURITY
+# CALLBACKS
 # =========================================================
 
 async def callback_handler(
@@ -303,13 +415,11 @@ async def callback_handler(
     if query is None or query.from_user is None:
         return
 
-    await query.answer()
-
     user_id = query.from_user.id
-    data = query.data
+    data = query.data or ""
 
     # -----------------------------------------------------
-    # OWNER-ONLY CALLBACKS
+    # OWNER CALLBACKS
     # -----------------------------------------------------
 
     if data.startswith("owner_"):
@@ -320,95 +430,70 @@ async def callback_handler(
             )
             return
 
+        await query.answer()
+
         if data == "owner_users":
             await query.edit_message_text(
                 "👥 VIKKY USERS\n\n"
-                "User access management is ready.\n\n"
-                "Use owner commands:\n"
+                "Access management is active.\n\n"
                 "/grant USER_ID DAYS\n"
                 "/revoke USER_ID\n\n"
-                "Default access period: 30 days.",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ OWNER MENU",
-                            callback_data="back_owner",
-                        )
-                    ]
-                ]),
+                "Default access: 30 days.",
+                reply_markup=back_owner_menu(),
             )
             return
 
         if data == "owner_uploaders":
             await query.edit_message_text(
                 "📤 VIKKY UPLOADERS\n\n"
-                "Uploader management is ready.\n\n"
-                "Use owner commands:\n"
+                "Uploader management is active.\n\n"
                 "/uploaders add USER_ID\n"
                 "/uploaders remove USER_ID",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ OWNER MENU",
-                            callback_data="back_owner",
-                        )
-                    ]
-                ]),
+                reply_markup=back_owner_menu(),
             )
             return
 
         if data == "owner_payments":
             await query.edit_message_text(
                 "💳 VIKKY PAYMENTS\n\n"
-                "Payment management module is ready.\n\n"
-                "Next: payment plans, QR flow, proof review, "
-                "and owner confirmation.",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ OWNER MENU",
-                            callback_data="back_owner",
-                        )
-                    ]
-                ]),
+                "Payment backend is reserved for the "
+                "real payment/QR integration.\n\n"
+                "No fake payment confirmation is used.",
+                reply_markup=back_owner_menu(),
             )
             return
 
         if data == "owner_hosts":
             await query.edit_message_text(
                 "☁️ VIKKY UPLOAD HOSTS\n\n"
-                "Upload host management module is ready.\n\n"
-                "Next: Google Drive + additional host pool, "
-                "automatic routing, retry, and owner selection.",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ OWNER MENU",
-                            callback_data="back_owner",
-                        )
-                    ]
-                ]),
+                "Google Drive + external host adapters "
+                "are configured in the backend.\n\n"
+                "Provider upload is only reported as "
+                "successful after real provider confirmation.",
+                reply_markup=back_owner_menu(),
+            )
+            return
+
+        if data == "owner_jobs":
+            await query.edit_message_text(
+                "📊 VIKKY JOBS / WORKERS\n\n"
+                "GPU-first orchestration, queueing, "
+                "retry and worker recovery are handled "
+                "by the backend worker layer.",
+                reply_markup=back_owner_menu(),
             )
             return
 
         await query.edit_message_text(
             "👑 VIKKY OWNER CONTROL\n\n"
-            f"Selected: {data.replace('owner_', '').upper()}\n\n"
-            "🔐 Authorization verified.\n"
-            "⚙️ This module will be connected to the real backend next.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ OWNER MENU",
-                        callback_data="back_owner",
-                    )
-                ]
-            ]),
+            f"Selected: {data[6:].upper()}\n\n"
+            "🔐 Owner authorization verified.",
+            reply_markup=back_owner_menu(),
         )
         return
 
     # -----------------------------------------------------
-    # OWNER MENU
+    # BACK OWNER
     # -----------------------------------------------------
 
     if data == "back_owner":
@@ -419,6 +504,8 @@ async def callback_handler(
             )
             return
 
+        await query.answer()
+
         await query.edit_message_text(
             "👑 VIKKY OWNER PANEL\n\n"
             "🔐 Owner authorization verified.\n"
@@ -428,91 +515,91 @@ async def callback_handler(
         return
 
     # -----------------------------------------------------
-    # USER ACCESS
+    # LOCKED USER
     # -----------------------------------------------------
 
     if data == "get_access":
+        await query.answer()
+
         await query.edit_message_text(
             "💳 VIKKY ACCESS\n\n"
-            "Your access request/payment flow will be connected here.\n\n"
-            "🔒 Processing remains locked until owner approval.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ BACK",
-                        callback_data="back_locked",
-                    )
-                ]
-            ]),
+            "Your access request has to be approved "
+            "by a VIKKY owner.\n\n"
+            "🔒 Processing remains locked until approval.",
+            reply_markup=back_locked_menu(),
         )
         return
 
     if data == "contact_owner":
+        await query.answer()
+
         await query.edit_message_text(
             "📞 CONTACT OWNER\n\n"
-            "Owner contact flow will be connected here.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ BACK",
-                        callback_data="back_locked",
-                    )
-                ]
-            ]),
+            "Please contact a VIKKY owner for access "
+            "and payment instructions.",
+            reply_markup=back_locked_menu(),
         )
         return
 
     if data == "back_locked":
+        await query.answer()
+
         await query.edit_message_text(
             "🎬 VIKKY Encoder\n\n"
             "🔒 Your access is currently locked.\n"
-            "Processing features are available after approval.",
+            "Processing is available after approval.",
             reply_markup=locked_menu(),
         )
         return
 
     # -----------------------------------------------------
-    # PROCESSING BUTTONS
+    # PROCESSING ACCESS CHECK
     # -----------------------------------------------------
-    # These are intentionally protected.
-    # Until the real user-access database is connected,
-    # non-owners cannot execute processing.
 
-    if data in {"user_encoding", "user_upscale", "user_hybrid"}:
-        if not is_owner(user_id):
+    if data in {
+        "user_encoding",
+        "user_upscale",
+        "user_hybrid",
+    }:
+        if not has_access(user_id):
             await query.answer(
                 "🔒 Access required.",
                 show_alert=True,
             )
             return
 
+        await query.answer()
+
+        mode = {
+            "user_encoding": "🎯 ENCODING",
+            "user_upscale": "✨ AI UPSCALE",
+            "user_hybrid": "💎 HYBRID REMASTER",
+        }[data]
+
         await query.edit_message_text(
-            "🎬 Processing control selected.\n\n"
-            "Real processing backend will be connected next.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅️ OWNER MENU",
-                        callback_data="back_owner",
-                    )
-                ]
-            ]),
+            f"{mode}\n\n"
+            "✅ Access verified.\n\n"
+            "The processing request is accepted by "
+            "the bot access layer.\n\n"
+            "⚙️ Worker execution will only be reported "
+            "after the real worker returns a verified result.",
+            reply_markup=processing_menu(),
         )
         return
 
     # -----------------------------------------------------
-    # UNKNOWN CALLBACK
+    # UNKNOWN
     # -----------------------------------------------------
+
+    await query.answer(
+        "Unknown action.",
+        show_alert=True,
+    )
 
     logger.warning(
         "Unknown callback: user=%s data=%s",
         user_id,
         data,
-    )
-
-    await query.answer(
-        "Unknown action.",
-        show_alert=True,
     )
 
 
@@ -524,9 +611,16 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    logger.exception(
-        "Unhandled Telegram error",
-        exc_info=context.error,
+    logger.error(
+        "Unhandled Telegram error: %s",
+        context.error,
+        exc_info=(
+            type(context.error),
+            context.error,
+            context.error.__traceback__,
+        )
+        if context.error
+        else None,
     )
 
 
@@ -546,10 +640,21 @@ def build_application() -> Application:
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("grant", grant_command))
-    application.add_handler(CommandHandler("revoke", revoke_command))
-    application.add_handler(CommandHandler("uploaders", uploaders_command))
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("grant", grant_command)
+    )
+
+    application.add_handler(
+        CommandHandler("revoke", revoke_command)
+    )
+
+    application.add_handler(
+        CommandHandler("uploaders", uploaders_command)
+    )
 
     application.add_handler(
         CallbackQueryHandler(callback_handler)
@@ -570,7 +675,7 @@ def main():
     application = build_application()
 
     logger.info(
-        "VIKKY Encoder started successfully | owners=%d",
+        "VIKKY Encoder started | owners=%d",
         len(OWNER_IDS),
     )
 
