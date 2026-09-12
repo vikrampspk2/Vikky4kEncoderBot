@@ -1,0 +1,59 @@
+name: VIKKY Kaggle GPU Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "AI processing mode"
+        required: true
+        default: "4K_AI"
+        type: choice
+        options:
+          - 4K_AI
+
+jobs:
+  kaggle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        run: pip install --upgrade pip kaggle
+
+      - name: Push Kernel to Kaggle GPU
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          mkdir -p /tmp/vikky_kernel
+          cp cloud/kaggle_worker/main.py /tmp/vikky_kernel/main.py
+          cp cloud/kaggle_worker/requirements.txt /tmp/vikky_kernel/requirements.txt
+          cp cloud/kaggle_worker/kernel-metadata.json /tmp/vikky_kernel/kernel-metadata.json
+          cd /tmp/vikky_kernel
+          kaggle kernels push
+          echo "Kernel pushed to Kaggle successfully!"
+
+      - name: Wait for GPU Execution & Stream Logs
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          KERNEL_SLUG="mrvikky07/vikky-ai-worker"
+          echo "Tracking execution on Kaggle..."
+          sleep 10
+          while true; do
+            RAW_STATUS=$(kaggle kernels status "$KERNEL_SLUG")
+            echo "$RAW_STATUS"
+            if echo "$RAW_STATUS" | grep -qi "complete"; then
+              echo "EXECUTION COMPLETED SUCCESSFULLY!"
+              kaggle kernels output "$KERNEL_SLUG" -p /tmp/output
+              ls -lah /tmp/output
+              break
+            elif echo "$RAW_STATUS" | grep -qi "error"; then
+              echo "EXECUTION FAILED ON KAGGLE!"
+              kaggle kernels output "$KERNEL_SLUG" -p /tmp/output || true
+              cat /tmp/output/*.log || true
+              exit 1
+            fi
+            sleep 20
+          done
