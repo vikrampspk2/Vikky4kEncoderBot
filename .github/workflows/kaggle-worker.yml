@@ -66,8 +66,7 @@ jobs:
     timeout-minutes: 15
 
     env:
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE1_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE1_KEY }}
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       VIKKY_MODE: ${{ inputs.mode }}
 
     steps:
@@ -85,36 +84,18 @@ jobs:
       - name: Authenticate Kaggle
         shell: bash
         env:
-          VIKKY_KAGGLE_USERNAME: ${{ secrets.KAGGLE1_USERNAME }}
-          VIKKY_KAGGLE_KEY: ${{ secrets.KAGGLE1_KEY }}
+          VIKKY_KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           set -euo pipefail
 
-          if [ -z "${VIKKY_KAGGLE_USERNAME}" ]; then
-            echo "ERROR: KAGGLE1_USERNAME secret is empty or unavailable."
+          if [ -z "${VIKKY_KAGGLE_API_TOKEN}" ]; then
+            echo "ERROR: KAGGLE_API_TOKEN secret is empty or unavailable."
             exit 1
           fi
 
-          if [ -z "${VIKKY_KAGGLE_KEY}" ]; then
-            echo "ERROR: KAGGLE1_KEY secret is empty or unavailable."
-            exit 1
-          fi
+          echo "KAGGLE API TOKEN: PRESENT"
 
-          echo "KAGGLE USERNAME: PRESENT"
-          echo "KAGGLE KEY: PRESENT"
-          echo "KAGGLE KEY LENGTH: ${#VIKKY_KAGGLE_KEY}"
-
-          mkdir -p "$HOME/.config/kaggle"
-          chmod 700 "$HOME/.config/kaggle"
-
-          cat > "$HOME/.config/kaggle/kaggle.json" <<EOF
-          {
-            "username": "${VIKKY_KAGGLE_USERNAME}",
-            "key": "${VIKKY_KAGGLE_KEY}"
-          }
-          EOF
-
-          chmod 600 "$HOME/.config/kaggle/kaggle.json"
+          export KAGGLE_API_TOKEN="${VIKKY_KAGGLE_API_TOKEN}"
 
           echo "Testing Kaggle API authentication..."
 
