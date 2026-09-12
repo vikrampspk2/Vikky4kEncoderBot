@@ -66,8 +66,8 @@ jobs:
     timeout-minutes: 15
 
     env:
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE1_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE1_KEY }}
       VIKKY_MODE: ${{ inputs.mode }}
 
     steps:
