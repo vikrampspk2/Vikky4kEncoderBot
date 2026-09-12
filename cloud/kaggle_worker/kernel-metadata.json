@@ -1,6 +1,6 @@
 {
   "id": "mrvikky07/vikky-ai-worker",
-  "title": "VIKKY AI GPU Worker",
+  "title": "vikky-ai-worker",
   "code_file": "main.py",
   "language": "python",
   "kernel_type": "script",
