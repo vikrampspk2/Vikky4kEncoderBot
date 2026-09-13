@@ -1,0 +1,22 @@
+[Unit]
+Description=VIKKY Encoder Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL
+EnvironmentFile=/ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/.env
+ExecStart=/ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/.venv/bin/python /ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/config /ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/temp /ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/outputs /ABSOLUTE/PATH/TO/VIKKY_ENCODER_FINAL_TOTAL/logs
+
+[Install]
+WantedBy=multi-user.target

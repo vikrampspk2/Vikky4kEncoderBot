@@ -1,0 +1,124 @@
+{
+  "providers": [
+    {
+      "slot": 1,
+      "name": "buzzheavier",
+      "enabled": true,
+      "priority": 10,
+      "attempts": 2,
+      "token_env": "BUZZHEAVIER_ACCOUNT_ID"
+    },
+    {
+      "slot": 2,
+      "name": "gofile",
+      "enabled": true,
+      "priority": 20,
+      "attempts": 2,
+      "token_env": "GOFILE_TOKEN"
+    },
+    {
+      "slot": 3,
+      "name": "0807",
+      "enabled": false,
+      "priority": 30,
+      "attempts": 2,
+      "token_env": "UPLOAD_0807_TOKEN"
+    },
+    {
+      "slot": 4,
+      "name": "storage_to",
+      "enabled": false,
+      "priority": 40,
+      "attempts": 2,
+      "token_env": "STORAGE_TO_TOKEN"
+    },
+    {
+      "slot": 5,
+      "name": "pixeldrain",
+      "enabled": false,
+      "priority": 50,
+      "attempts": 2,
+      "token_env": "PIXELDRAIN_API_KEY"
+    },
+    {
+      "slot": 6,
+      "name": "slot06",
+      "enabled": false,
+      "priority": 60,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 7,
+      "name": "slot07",
+      "enabled": false,
+      "priority": 70,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 8,
+      "name": "slot08",
+      "enabled": false,
+      "priority": 80,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 9,
+      "name": "slot09",
+      "enabled": false,
+      "priority": 90,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 10,
+      "name": "slot10",
+      "enabled": false,
+      "priority": 100,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 11,
+      "name": "slot11",
+      "enabled": false,
+      "priority": 110,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 12,
+      "name": "slot12",
+      "enabled": false,
+      "priority": 120,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 13,
+      "name": "slot13",
+      "enabled": false,
+      "priority": 130,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 14,
+      "name": "slot14",
+      "enabled": false,
+      "priority": 140,
+      "attempts": 2,
+      "token_env": ""
+    },
+    {
+      "slot": 15,
+      "name": "slot15",
+      "enabled": false,
+      "priority": 150,
+      "attempts": 2,
+      "token_env": ""
+    }
+  ]
+}

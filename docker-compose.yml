@@ -1,0 +1,10 @@
+services:
+  vikky:
+    image: python:3.13-slim
+    working_dir: /app
+    restart: always
+    env_file: .env
+    volumes:
+      - ./:/app
+    command: >-
+      bash -lc "apt-get update && apt-get install -y ffmpeg aria2 curl && pip install -r requirements.txt && python main.py"

@@ -1,13 +1,32 @@
-import asyncio, hashlib, json, os, re, shutil, sqlite3, subprocess, time, uuid
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-    MessageHandler, filters
+from hydrogram import Client, enums, filters, idle
+from hydrogram.handlers import CallbackQueryHandler, MessageHandler
+from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from config.weekly_quota import (
+    ensure_schema as ensure_quota_schema,
+    get_usage as quota_usage,
+    can_consume as quota_can_consume,
+    consume as quota_consume,
 )
+from workers.downloader import download_url, extract_url
 
 load_dotenv()
 
@@ -17,24 +36,29 @@ DB = BASE / "config" / "vikky.db"
 TEMP = BASE / "temp"
 OUT = BASE / "outputs"
 REPORTS = BASE / "logs"
-PAYMENT_DIR = BASE / "config" / "payment"
-QR_PATH = Path(os.getenv("VIKKY_QR_PATH", str(PAYMENT_DIR / "fampay_qr.png")))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_ID = os.getenv("API_ID", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
 OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = int(CHANNEL_ID_RAW) if re.fullmatch(r"-?\d+", CHANNEL_ID_RAW) else (CHANNEL_ID_RAW or None)
 MAX_INPUT_GB = float(os.getenv("VIKKY_MAX_INPUT_GB", "60"))
 WORKER_CMD = os.getenv("VIKKY_WORKER_CMD", "").strip()
 LIVE_INTERVAL = max(2, int(os.getenv("VIKKY_LIVE_INTERVAL", "5")))
 FAMPAY_UPI = os.getenv("FAMPAY_UPI", "").strip()
-CONTACT_DELETE_HOURS = max(1, int(os.getenv("CONTACT_DELETE_HOURS", "24")))
+WEEKLY_QUOTA_GB = float(os.getenv("VIKKY_WEEKLY_QUOTA_GB", "200"))
+WEEKLY_QUOTA_TASKS = max(1, int(os.getenv("VIKKY_WEEKLY_QUOTA_TASKS", "15")))
+MAX_WORKERS = max(1, int(os.getenv("VIKKY_MAX_WORKERS", "1")))
+AI_CMD = os.getenv("VIKKY_AI_CMD", "").strip()
+REALESRGAN_DIR = os.getenv("REALESRGAN_DIR", str(BASE / "third_party" / "Real-ESRGAN")).strip()
 
-# Paid service plans. Owners bypass all entitlement checks.
 PLANS = {
-    "ENCODE_300": {"label": "🎬 Encoding — ₹300", "days": 30, "kind": "encode"},
-    "UP2K_350": {"label": "✨ 2K Upscale — ₹350", "days": 30, "kind": "upscale_2k"},
-    "UP4K_500": {"label": "✨ 4K Upscale — ₹500", "days": 30, "kind": "upscale_4k"},
-    "UP8K_1400": {"label": "🔥 8K Upscale — ₹1400", "days": 30, "kind": "upscale_8k"},
-    "ALL_2500": {"label": "👑 Monthly Full Bot Access — ₹2500", "days": 30, "kind": "all"},
+    "ENCODE_300": {"label": "Encoding - Rs 300", "days": 30, "kind": "encode"},
+    "UP2K_350": {"label": "2K Upscale - Rs 350", "days": 30, "kind": "upscale_2k"},
+    "UP4K_500": {"label": "4K Upscale - Rs 500", "days": 30, "kind": "upscale_4k"},
+    "UP8K_1400": {"label": "8K Upscale - Rs 1400", "days": 30, "kind": "upscale_8k"},
+    "ALL_2500": {"label": "Monthly Full Bot Access - Rs 2500", "days": 30, "kind": "all"},
 }
 
 MODES = {
@@ -43,12 +67,16 @@ MODES = {
     "hybrid": ["4K_HYBRID", "8K_HYBRID"],
 }
 
-for p in (TEMP, OUT, REPORTS, DB.parent, PAYMENT_DIR):
+for p in (TEMP, OUT, REPORTS, DB.parent):
     p.mkdir(parents=True, exist_ok=True)
+
+active_jobs: set[str] = set()
+worker_sem = asyncio.Semaphore(MAX_WORKERS)
+worker_tasks: set[asyncio.Task] = set()
 
 
 def db():
-    c = sqlite3.connect(DB, timeout=30)
+    c = sqlite3.connect(DB, timeout=60)
     c.row_factory = sqlite3.Row
     return c
 
@@ -65,27 +93,30 @@ def init_db():
       status TEXT NOT NULL, progress INTEGER DEFAULT 0, input TEXT, output TEXT, error TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
       duration REAL DEFAULT 0, size INTEGER DEFAULT 0, sha256 TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, uid INTEGER, event TEXT, created INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS deliveries(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, uid INTEGER, provider TEXT, url TEXT, status TEXT, created INTEGER NOT NULL);
     """)
-    # Migrate older DBs safely.
+    ensure_quota_schema(c)
     cols = {r[1] for r in c.execute("PRAGMA table_info(payments)").fetchall()}
-    if "plan" not in cols:
-        c.execute("ALTER TABLE payments ADD COLUMN plan TEXT NOT NULL DEFAULT 'ALL_2500'")
-    if "updated" not in cols:
-        c.execute("ALTER TABLE payments ADD COLUMN updated INTEGER NOT NULL DEFAULT 0")
-    if "proof_file" not in cols:
-        c.execute("ALTER TABLE payments ADD COLUMN proof_file TEXT DEFAULT ''")
-    if "proof_message_id" not in cols:
-        c.execute("ALTER TABLE payments ADD COLUMN proof_message_id INTEGER DEFAULT 0")
+    for name, ddl in (
+        ("plan", "ALTER TABLE payments ADD COLUMN plan TEXT NOT NULL DEFAULT 'ALL_2500'"),
+        ("updated", "ALTER TABLE payments ADD COLUMN updated INTEGER NOT NULL DEFAULT 0"),
+        ("proof_file", "ALTER TABLE payments ADD COLUMN proof_file TEXT DEFAULT ''"),
+        ("proof_message_id", "ALTER TABLE payments ADD COLUMN proof_message_id INTEGER DEFAULT 0"),
+    ):
+        if name not in cols:
+            c.execute(ddl)
     c.execute("UPDATE payments SET updated=created WHERE updated=0")
+    # Jobs interrupted during a process restart become queued again.
     c.execute("UPDATE jobs SET status='queued', updated=? WHERE status='processing'", (int(time.time()),))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
-def is_owner(uid):
+def is_owner(uid: int) -> bool:
     return int(uid) in OWNER_IDS
 
 
-def entitlement_ok(uid, kind):
+def entitlement_ok(uid: int, kind: str) -> bool:
     if is_owner(uid):
         return True
     now = int(time.time())
@@ -93,38 +124,28 @@ def entitlement_ok(uid, kind):
     rows = c.execute("SELECT plan,until FROM entitlements WHERE uid=? AND until>?", (uid, now)).fetchall()
     c.close()
     for r in rows:
-        if r["plan"] == "ALL_2500":
-            return True
-        if r["plan"] == "ENCODE_300" and kind == "encode":
-            return True
-        if r["plan"] == "UP2K_350" and kind == "upscale_2k":
-            return True
-        if r["plan"] == "UP4K_500" and kind == "upscale_4k":
-            return True
-        if r["plan"] == "UP8K_1400" and kind == "upscale_8k":
-            return True
+        if r["plan"] == "ALL_2500": return True
+        if r["plan"] == "ENCODE_300" and kind == "encode": return True
+        if r["plan"] == "UP2K_350" and kind == "upscale_2k": return True
+        if r["plan"] == "UP4K_500" and kind == "upscale_4k": return True
+        if r["plan"] == "UP8K_1400" and kind == "upscale_8k": return True
     return False
 
 
-def access_ok(uid):
-    # Compatibility helper: any active paid entitlement unlocks basic access.
-    return is_owner(uid) or entitlement_ok(uid, "encode") or entitlement_ok(uid, "upscale_2k") or entitlement_ok(uid, "upscale_4k") or entitlement_ok(uid, "upscale_8k")
+def touch_user(uid: int):
+    c = db(); c.execute("INSERT OR IGNORE INTO users(uid,created) VALUES(?,?)", (uid, int(time.time()))); c.commit(); c.close()
 
 
-def touch_user(uid):
-    c = db(); c.execute("INSERT OR IGNORE INTO users(uid, created) VALUES(?,?)", (uid, int(time.time()))); c.commit(); c.close()
-
-
-def event(jid, uid, text):
+def event(jid: str, uid: int, text: str):
     c = db(); c.execute("INSERT INTO events(job_id,uid,event,created) VALUES(?,?,?,?)", (jid, uid, text[:1000], int(time.time()))); c.commit(); c.close()
 
 
-def safe_name(name):
+def safe_name(name: str) -> str:
     stem = Path(name or "video").stem
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", stem).strip(" .")[:160] or "video"
 
 
-def ffprobe(path):
+def ffprobe(path: Path) -> dict:
     try:
         p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration,size", "-of", "json", str(path)], capture_output=True, text=True, timeout=60)
         return json.loads(p.stdout or "{}")
@@ -132,15 +153,21 @@ def ffprobe(path):
         return {}
 
 
-def sha256(path):
+def sha256(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""): h.update(chunk)
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
     return h.hexdigest()
 
 
 def kb(rows):
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
+
+
+def plain_kwargs():
+    # Hydrogram's disabled parse mode prevents dynamic underscores from being parsed.
+    return {"parse_mode": enums.ParseMode.DISABLED}
 
 
 def plan_keyboard():
@@ -150,467 +177,515 @@ def plan_keyboard():
         [(PLANS["UP4K_500"]["label"], "buy:UP4K_500")],
         [(PLANS["UP8K_1400"]["label"], "buy:UP8K_1400")],
         [(PLANS["ALL_2500"]["label"], "buy:ALL_2500")],
-        [("📩 Contact Admin", "support")],
-        [("❌ Close", "cancel")],
+        [("Contact Admin", "support")],
+        [("Close", "cancel")],
     ])
 
 
 def owner_home_keyboard():
     return kb([
-        [("🎬 Encode", "cmd:encode"), ("✨ Upscale", "cmd:upscale")],
-        [("🔥 Hybrid", "cmd:hybrid"), ("📊 Jobs", "jobs")],
-        [("💳 Payment Requests", "payments"), ("📩 Support Inbox", "support_inbox")],
-        [("❤️ Health", "health")],
+        [("Encode", "cmd:encode"), ("Upscale", "cmd:upscale")],
+        [("Hybrid", "cmd:hybrid"), ("Jobs", "jobs")],
+        [("Payment Requests", "payments"), ("Health", "health")],
     ])
 
 
-async def start(update, context):
-    uid = update.effective_user.id; touch_user(uid)
+async def start(client, message):
+    uid = message.from_user.id; touch_user(uid)
     if is_owner(uid):
-        await update.message.reply_text(
-            "👑 *VIKKY Encoder — OWNER*\n\n"
-            "♾️ Lifetime FREE access\n"
-            "🎬 Encoding: FREE\n✨ 2K/4K/8K Upscale: FREE\n🔥 Hybrid: FREE\n\n"
-            "You never need to pay. Use the Owner Panel below.",
-            parse_mode="Markdown", reply_markup=owner_home_keyboard())
-        return
-    await update.message.reply_text(
-        "🎞️ *VIKKY Encoder*\n\n"
-        "🏆 Best-quality video encoding & AI upscaling service\n"
-        "🎬 Encoding • 2K • 4K • 8K • Hybrid\n"
-        "🎞️ Final output: *MKV only*\n\n"
-        "🔒 Paid processing is required.\n"
-        "Choose exactly what you want below.\n"
-        "\n📌 Payment is *manual verification only*. Access is never activated automatically.",
-        parse_mode="Markdown", reply_markup=plan_keyboard())
+        await message.reply_text("VIKKY Encoder - OWNER\n\nLifetime FREE access.\nEncoding, 2K, 4K, 8K and Hybrid are unlocked.", reply_markup=owner_home_keyboard(), **plain_kwargs())
+    else:
+        await message.reply_text("VIKKY Encoder\n\nEncoding - 2K - 4K - 8K - Hybrid\nFinal output: MKV only\n\nPaid processing is required. Payment is manual verification only.", reply_markup=plan_keyboard(), **plain_kwargs())
 
 
-async def pay(update, context):
-    if is_owner(update.effective_user.id):
-        await update.message.reply_text("👑 Owner access is lifetime FREE. No payment is required.")
-        return
-    await update.message.reply_text("💳 Select the service you want to purchase:", reply_markup=plan_keyboard())
+async def pay(client, message):
+    if is_owner(message.from_user.id):
+        await message.reply_text("Owner access is lifetime FREE. No payment is required.", **plain_kwargs()); return
+    await message.reply_text("Select the service you want to purchase:", reply_markup=plan_keyboard(), **plain_kwargs())
 
 
-async def show_payment_request(q, context, plan_code):
+async def show_payment_request(q, client, plan_code):
     uid = q.from_user.id; plan = PLANS[plan_code]; touch_user(uid)
     if is_owner(uid):
-        await q.edit_message_text("👑 Owner access is FREE. Payment is disabled for owners.")
-        return
+        await q.edit_message_text("Owner access is lifetime FREE. Payment is disabled for owners.", **plain_kwargs()); return
     pid = uuid.uuid4().hex[:12].upper(); now = int(time.time()); payload = f"VIKKY-{pid}"
-    c = db(); c.execute("INSERT INTO payments(id,uid,plan,payload,status,created,updated) VALUES(?,?,?,?,?,?,?)", (pid,uid,plan_code,payload,"awaiting_qr",now,now)); c.commit(); c.close()
-    await q.edit_message_text(
-        f"💳 *{plan['label']}*\n\n"
-        f"Your request has been sent to the owner for QR approval.\n"
-        f"🧾 Request: `{pid}`\n\n"
-        "⏳ *QR is NOT sent automatically.*\n"
-        "The owner must approve the QR request first.\n\n"
-        "After payment, use the button below and send your proof. Access is activated only after manual owner verification.",
-        parse_mode="Markdown", reply_markup=kb([[('📷 Request QR from Admin', f'qrreq:{pid}')], [('⬅️ Plans', 'paymenu')]])
-    )
+    c = db(); c.execute("INSERT INTO payments(id,uid,plan,payload,status,created,updated) VALUES(?,?,?,?,?,?,?)", (pid, uid, plan_code, payload, "awaiting_payment", now, now)); c.commit(); c.close()
+    payline = FAMPAY_UPI or "Payment ID is not configured yet"
+    await q.edit_message_text(f"{plan['label']}\n\nFamPay / UPI ID:\n{payline}\n\nRequest: {pid}\n\nPay externally, then press I have Paid and send proof.\nAccess activates only after owner verification.\nNo QR code is used.", reply_markup=kb([[("I have Paid", f"paid:{pid}")], [("Contact Admin", "support")], [("Plans", "paymenu")]]), **plain_kwargs())
     for oid in OWNER_IDS:
         try:
-            await context.bot.send_message(oid, f"💳 PAYMENT REQUEST `{pid}`\nUser ID: `{uid}`\nPlan: *{plan['label']}*\n\nApprove QR or reject:", parse_mode="Markdown", reply_markup=kb([[('✅ Send QR', f'qrapprove:{pid}'), ('❌ Reject', f'qrreject:{pid}')]]))
+            await client.send_message(oid, f"PAYMENT REQUEST {pid}\nUser: {uid}\nPlan: {plan['label']}\nStatus: awaiting payment", **plain_kwargs())
         except Exception:
             pass
 
 
-async def request_qr(q, context, pid):
-    uid=q.from_user.id
-    c=db(); r=c.execute("SELECT * FROM payments WHERE id=? AND uid=?",(pid,uid)).fetchone(); c.close()
-    if not r: await q.edit_message_text("❌ Payment request not found."); return
-    if r["status"] not in ("awaiting_qr", "qr_requested"):
-        await q.edit_message_text("ℹ️ This payment request is already processed or closed."); return
-    now=int(time.time()); c=db(); c.execute("UPDATE payments SET status='qr_requested',updated=? WHERE id=?",(now,pid)); c.commit(); c.close()
-    await q.edit_message_text(f"⏳ QR request `{pid}` sent to the owner. Wait for approval.",parse_mode="Markdown")
-    for oid in OWNER_IDS:
+async def mark_paid(q, client, pid):
+    uid=q.from_user.id; c=db(); r=c.execute("SELECT * FROM payments WHERE id=? AND uid=?",(pid,uid)).fetchone(); c.close()
+    if not r: await q.edit_message_text("Payment request not found.", **plain_kwargs()); return
+    c=db(); c.execute("UPDATE payments SET status='proof_pending',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
+    await q.edit_message_text(f"Request {pid} is ready. Send your payment proof as a screenshot/photo or transaction text.", **plain_kwargs())
+
+
+async def proof_media(client, message) -> bool:
+    uid = message.from_user.id; text = (message.text or message.caption or "").strip()
+    c=db(); r=c.execute("SELECT * FROM payments WHERE uid=? AND status='proof_pending' ORDER BY updated DESC LIMIT 1",(uid,)).fetchone(); c.close()
+    if not r: return False
+    stored = ""
+    media = message.photo or message.document
+    if media:
+        obj = message.photo[-1] if message.photo else message.document
+        path = TEMP / f"payment_{r['id']}_{message.id}"
         try:
-            await context.bot.send_message(oid, f"📷 QR requested for `{pid}` by user `{uid}`. Approve to send the configured QR.", parse_mode="Markdown", reply_markup=kb([[('✅ Send QR', f'qrapprove:{pid}'), ('❌ Reject', f'qrreject:{pid}')]]))
-        except Exception: pass
-
-
-async def approve_qr(q, context, pid):
-    if not is_owner(q.from_user.id): return
-    c=db(); r=c.execute("SELECT * FROM payments WHERE id=?",(pid,)).fetchone()
-    if not r: c.close(); await q.edit_message_text("❌ Request not found."); return
-    c.execute("UPDATE payments SET status='qr_sent',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
-    if not QR_PATH.exists():
-        await q.edit_message_text(f"⚠️ QR file is not installed. Put your QR image at:\n`{QR_PATH}`\nthen retry QR approval.",parse_mode="Markdown"); return
-    caption = f"📷 Payment QR\nPlan: {PLANS[r['plan']]['label']}\nUPI: {FAMPAY_UPI or 'configured privately'}\nRequest: {pid}\n\nAfter payment tap *I've Paid* and send proof."
-    try:
-        await context.bot.send_photo(r["uid"], photo=str(QR_PATH), caption=caption, parse_mode="Markdown", reply_markup=kb([[('✅ I’ve Paid', f'paid:{pid}')]]))
-        await q.edit_message_text(f"✅ QR sent to user for `{pid}`. Your owner ID/username was not revealed.",parse_mode="Markdown")
-    except Exception as e:
-        await q.edit_message_text(f"❌ Could not send QR: {str(e)[:500]}")
-
-
-async def reject_qr(q, context, pid):
-    if not is_owner(q.from_user.id): return
-    c=db(); r=c.execute("SELECT uid FROM payments WHERE id=?",(pid,)).fetchone()
-    if not r: c.close(); await q.edit_message_text("❌ Request not found."); return
-    c.execute("UPDATE payments SET status='qr_rejected',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
-    await context.bot.send_message(r["uid"], f"❌ QR request `{pid}` was not approved. Use Contact Admin if you need help.",parse_mode="Markdown",reply_markup=kb([[('📩 Contact Admin','support')]]))
-    await q.edit_message_text(f"❌ QR request `{pid}` rejected.")
-
-
-async def mark_paid(q, context, pid):
-    uid=q.from_user.id; c=db(); r=c.execute("SELECT * FROM payments WHERE id=? AND uid=?",(pid,uid)).fetchone()
-    if not r: c.close(); await q.edit_message_text("❌ Payment request not found."); return
-    c.execute("UPDATE payments SET status='proof_pending',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
-    context.user_data["proof_payment"] = pid
-    await q.edit_message_text(f"🧾 Request `{pid}` marked as paid.\n\nNow send your payment proof (screenshot/photo or transaction text).\n\n⏳ Access remains LOCKED until owner verification.",parse_mode="Markdown")
-
-
-async def proof_media(update, context):
-    pid=context.user_data.get("proof_payment")
-    if not pid: return False
-    uid=update.effective_user.id; c=db(); r=c.execute("SELECT * FROM payments WHERE id=? AND uid=?",(pid,uid)).fetchone()
-    if not r: c.close(); return False
-    proof_dir=BASE/"config"/"payment_proofs"; proof_dir.mkdir(parents=True,exist_ok=True)
-    fname=f"{pid}_{int(time.time())}"
-    obj=update.message.photo[-1] if update.message.photo else update.message.document
-    if obj:
-        ext=".jpg" if update.message.photo else (Path(getattr(obj,"file_name","")).suffix or ".bin")
-        path=proof_dir/(fname+ext)
-        f=await context.bot.get_file(obj.file_id); await f.download_to_drive(custom_path=str(path)); stored=str(path)
+            await message.download(file_name=str(path))
+            stored = str(path)
+        except Exception:
+            stored = ""
+    elif text:
+        stored = text[:2000]
     else:
-        stored="text-proof"
-    c.execute("UPDATE payments SET status='proof_submitted',updated=?,proof_file=?,proof_message_id=? WHERE id=?",(int(time.time()),stored,update.message.message_id,pid)); c.commit(); c.close()
-    context.user_data.pop("proof_payment",None)
-    await update.message.reply_text(f"✅ Proof received for `{pid}`.\n⏳ Owner will verify manually. No access is activated automatically.",parse_mode="Markdown")
+        return False
+    c=db(); c.execute("UPDATE payments SET status='proof_submitted',proof_file=?,proof_message_id=?,updated=? WHERE id=?",(stored,message.id,int(time.time()),r['id'])); c.commit(); c.close()
+    await message.reply_text(f"Payment proof received for {r['id']}. Access remains locked until owner verification.", **plain_kwargs())
+    buttons=[[InlineKeyboardButton("VERIFY + GRANT", callback_data=f"paidapprove:{r['id']}")],[InlineKeyboardButton("REJECT", callback_data=f"paidreject:{r['id']}")]]
     for oid in OWNER_IDS:
         try:
-            await context.bot.send_message(oid,f"🧾 PAYMENT PROOF `{pid}`\nUser: `{uid}`\nPlan: *{PLANS[r['plan']]['label']}*\nProof stored securely.\n\nApprove only after you verify payment.",parse_mode="Markdown",reply_markup=kb([[('✅ PAID — Grant',f'paidapprove:{pid}'),('❌ Reject',f'paidreject:{pid}')]]))
-            if obj: await context.bot.forward_message(oid, uid, update.message.message_id)
+            await client.send_message(oid, f"PAYMENT PROOF {r['id']}\nUser: {uid}\nPlan: {PLANS[r['plan']]['label']}\nVerify manually before granting.", reply_markup=InlineKeyboardMarkup(buttons), **plain_kwargs())
         except Exception: pass
     return True
 
 
-async def support_start(q, context):
-    context.user_data["support_mode"] = True
-    await q.edit_message_text("📩 *Contact Admin*\n\nSend your message now. It will be delivered to the owner through the bot.\n\n🔐 Your private owner ID/contact details are not revealed.",parse_mode="Markdown",reply_markup=kb([[('❌ Cancel','cancel')]]))
+async def support_start(q, client):
+    await q.edit_message_text("Send your support message now.", reply_markup=kb([[('Cancel','cancel')]]), **plain_kwargs())
 
 
-async def support_message(update, context):
-    if not context.user_data.get("support_mode"): return False
-    uid=update.effective_user.id
-    text=(update.message.text or update.message.caption or "[media message]")[:4000]
-    rid=uuid.uuid4().hex[:10].upper(); now=int(time.time())
-    c=db(); c.execute("INSERT INTO support_requests(id,uid,text,status,created,updated) VALUES(?,?,?,?,?,?)",(rid,uid,text,"open",now,now)); c.commit(); c.close()
-    context.user_data.pop("support_mode",None)
-    await update.message.reply_text(f"✅ Message sent to Admin.\nRequest ID: `{rid}`\n\nThe owner will reply through the bot.",parse_mode="Markdown")
+async def support_message(client, message) -> bool:
+    # Support mode is intentionally simple: a user sends /support first, then the next text is routed.
+    if not message.from_user: return False
+    uid=message.from_user.id
+    if not getattr(message, "text", None): return False
+    c=db(); pending=c.execute("SELECT id FROM support_requests WHERE uid=? AND status='waiting' ORDER BY created DESC LIMIT 1",(uid,)).fetchone(); c.close()
+    if not pending: return False
+    rid=pending["id"]; text=message.text[:4000]; now=int(time.time())
+    c=db(); c.execute("UPDATE support_requests SET text=?,status='open',updated=? WHERE id=?",(text,now,rid)); c.commit(); c.close()
+    await message.reply_text(f"Support request {rid} sent to Admin.", **plain_kwargs())
     for oid in OWNER_IDS:
-        try:
-            await context.bot.send_message(oid,f"📩 SUPPORT `{rid}`\nUser: `{uid}`\n\n{text}\n\nReply with:\n`/reply {rid} your message`",parse_mode="Markdown")
-            await context.bot.forward_message(oid,uid,update.message.message_id)
+        try: await client.send_message(oid, f"SUPPORT {rid}\nUser: {uid}\n\n{text}\n\nReply with /reply {rid} your message", **plain_kwargs())
         except Exception: pass
     return True
 
 
-async def reply_support(update, context):
-    if not is_owner(update.effective_user.id): return
-    if len(context.args)<2: await update.message.reply_text("Usage: /reply REQUEST_ID message"); return
-    rid=context.args[0]; msg=" ".join(context.args[1:])[:4000]
-    c=db(); r=c.execute("SELECT uid FROM support_requests WHERE id=?",(rid,)).fetchone()
-    if not r: c.close(); await update.message.reply_text("❌ Request not found."); return
-    c.execute("UPDATE support_requests SET status='replied',updated=? WHERE id=?",(int(time.time()),rid)); c.commit(); c.close()
-    await context.bot.send_message(r["uid"],f"💬 *Admin reply*\n\n{msg}",parse_mode="Markdown")
-    await update.message.reply_text(f"✅ Reply sent for `{rid}`.",parse_mode="Markdown")
+async def support_cmd(client, message):
+    uid=message.from_user.id; rid=uuid.uuid4().hex[:10].upper(); now=int(time.time()); touch_user(uid)
+    c=db(); c.execute("INSERT INTO support_requests(id,uid,text,status,created,updated) VALUES(?,?,?,?,?,?)",(rid,uid,"", "waiting",now,now)); c.commit(); c.close()
+    await message.reply_text(f"Support request {rid} created. Send your message now.", **plain_kwargs())
 
 
-async def paid_approve(q, context, pid):
+async def reply_support(client, message):
+    if not is_owner(message.from_user.id): return
+    args=message.text.split(maxsplit=2) if message.text else []
+    if len(args)<3: await message.reply_text("Usage: /reply REQUEST_ID message", **plain_kwargs()); return
+    rid,msg=args[1],args[2]; c=db(); r=c.execute("SELECT uid FROM support_requests WHERE id=?",(rid,)).fetchone(); c.close()
+    if not r: await message.reply_text("Request not found.", **plain_kwargs()); return
+    await client.send_message(r["uid"], f"Admin reply:\n\n{msg}", **plain_kwargs())
+    await message.reply_text("Reply sent.", **plain_kwargs())
+
+
+async def paid_approve(q, client, pid):
     if not is_owner(q.from_user.id): return
     c=db(); r=c.execute("SELECT * FROM payments WHERE id=?",(pid,)).fetchone(); c.close()
-    if not r: await q.edit_message_text("❌ Payment not found."); return
-    if r["status"] != "proof_submitted":
-        await q.edit_message_text("⚠️ Proof is not submitted or request already processed."); return
-    # Owner must explicitly select the entitlement before the final confirmation.
-    buttons=[]
-    for code,plan in PLANS.items():
-        buttons.append([(f"{plan['label']}",f"grantplan:{pid}:{code}")])
-    buttons.append([("❌ Reject",f"paidreject:{pid}")])
-    await q.edit_message_text(f"🧾 *VERIFY PAYMENT*\nRequest `{pid}`\nUser `{r['uid']}`\n\nSelect exactly what you are granting. Nothing is activated yet.",parse_mode="Markdown",reply_markup=kb(buttons))
+    if not r or r["status"] not in ("proof_submitted", "proof_pending"):
+        await q.edit_message_text("Proof is not submitted or request already processed.", **plain_kwargs()); return
+    buttons=[[InlineKeyboardButton(p["label"], callback_data=f"grantconfirm:{pid}:{code}")] for code,p in PLANS.items()]
+    await q.edit_message_text(f"VERIFY PAYMENT\nRequest: {pid}\nUser: {r['uid']}\n\nSelect the plan to grant:", reply_markup=InlineKeyboardMarkup(buttons), **plain_kwargs())
 
-async def choose_grant_plan(q, context, pid, plan_code):
-    if not is_owner(q.from_user.id): return
-    if plan_code not in PLANS: return
-    c=db(); r=c.execute("SELECT * FROM payments WHERE id=?",(pid,)).fetchone(); c.close()
-    if not r or r["status"] != "proof_submitted":
-        await q.edit_message_text("⚠️ Payment is no longer awaiting verification."); return
-    plan=PLANS[plan_code]
-    await q.edit_message_text(
-        f"⚠️ *FINAL CONFIRMATION*\n\nUser: `{r['uid']}`\nRequest: `{pid}`\nSelected: *{plan['label']}*\nDuration: {plan['days']} days\n\nAccess will be activated ONLY after you press Confirm.",
-        parse_mode="Markdown", reply_markup=kb([[('✅ CONFIRM & GRANT',f"grantconfirm:{pid}:{plan_code}")],[('⬅️ Change Plan',f"paidapprove:{pid}"),('❌ Reject',f"paidreject:{pid}")]]))
 
-async def confirm_grant(q, context, pid, plan_code):
-    if not is_owner(q.from_user.id): return
-    if plan_code not in PLANS: return
+async def confirm_grant(q, client, pid, plan_code):
+    if not is_owner(q.from_user.id) or plan_code not in PLANS: return
     c=db(); r=c.execute("SELECT * FROM payments WHERE id=?",(pid,)).fetchone()
-    if not r: c.close(); await q.edit_message_text("❌ Payment not found."); return
-    if r["status"] != "proof_submitted":
-        c.close(); await q.edit_message_text("⚠️ Already processed or not ready."); return
-    plan=PLANS[plan_code]; until=int(time.time())+plan["days"]*86400
+    if not r or r["status"] not in ("proof_submitted", "proof_pending"):
+        c.close(); await q.edit_message_text("Already processed or not ready.", **plain_kwargs()); return
+    until=int(time.time())+PLANS[plan_code]["days"]*86400
     c.execute("INSERT OR REPLACE INTO entitlements(uid,plan,until) VALUES(?,?,?)",(r["uid"],plan_code,until))
     c.execute("UPDATE users SET access_until=MAX(access_until,?) WHERE uid=?",(until,r["uid"]))
-    c.execute("UPDATE payments SET status='paid_verified',plan=?,updated=? WHERE id=?",(plan_code,int(time.time()),pid)); c.commit(); c.close()
-    await context.bot.send_message(r["uid"],f"✅ *Payment VERIFIED*\n\n{plan['label']}\n📅 Access active for {plan['days']} days.\n🔐 Activated manually by Admin.\n\nYou can now use the purchased service.",parse_mode="Markdown",reply_markup=kb([[('🎬 Open VIKKY','home')]]))
-    await q.edit_message_text(f"✅ *VERIFIED + ACCESS GRANTED*\nRequest `{pid}`\nGranted: {plan['label']}",parse_mode="Markdown")
+    c.execute("UPDATE payments SET status='verified',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
+    await client.send_message(r["uid"], f"Payment verified.\n\n{PLANS[plan_code]['label']}\nAccess active for 30 days.", **plain_kwargs())
+    await q.edit_message_text(f"VERIFIED + ACCESS GRANTED\nRequest {pid}\nGranted: {PLANS[plan_code]['label']}", **plain_kwargs())
 
 
-async def paid_reject(q, context, pid):
+async def paid_reject(q, client, pid):
     if not is_owner(q.from_user.id): return
-    c=db(); r=c.execute("SELECT uid FROM payments WHERE id=?",(pid,)).fetchone()
-    if not r: c.close(); await q.edit_message_text("❌ Payment not found."); return
-    c.execute("UPDATE payments SET status='rejected',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
-    await context.bot.send_message(r["uid"],f"❌ Payment proof `{pid}` was not verified.\nNo access was granted.\n\nContact Admin if you believe this is an error.",parse_mode="Markdown",reply_markup=kb([[('📩 Contact Admin','support')]]))
-    await q.edit_message_text(f"❌ Payment rejected: `{pid}`",parse_mode="Markdown")
+    c=db(); r=c.execute("SELECT uid FROM payments WHERE id=?",(pid,)).fetchone(); c.execute("UPDATE payments SET status='rejected',updated=? WHERE id=?",(int(time.time()),pid)); c.commit(); c.close()
+    if r: await client.send_message(r["uid"], f"Payment proof {pid} was not verified. No access was granted.", **plain_kwargs())
+    await q.edit_message_text(f"Payment rejected: {pid}", **plain_kwargs())
 
 
-async def payments(update, context):
-    if not is_owner(update.effective_user.id): return
-    c=db(); rows=c.execute("SELECT id,uid,plan,status,created FROM payments ORDER BY created DESC LIMIT 30").fetchall(); c.close()
-    text="💳 *Payment Requests*\n\n"+"\n".join(f"`{r['id']}` | {r['uid']} | {PLANS.get(r['plan'],{}).get('label',r['plan'])} | {r['status']}" for r in rows) if rows else "No payment requests."
-    await update.message.reply_text(text,parse_mode="Markdown")
-
-
-async def status(update, context):
-    uid=update.effective_user.id; touch_user(uid)
-    if is_owner(uid):
-        await update.message.reply_text("👑 OWNER — Lifetime FREE access to everything."); return
-    now=int(time.time()); c=db(); rows=c.execute("SELECT plan,until FROM entitlements WHERE uid=? AND until>?",(uid,now)).fetchall(); c.close()
-    if not rows: await update.message.reply_text("🔒 No active paid service access.",reply_markup=plan_keyboard()); return
-    text="✅ *Active Services*\n\n"+"\n".join(f"• {PLANS[r['plan']]['label']} — until {datetime.fromtimestamp(r['until'],timezone.utc).date().isoformat()}" for r in rows)
-    await update.message.reply_text(text,parse_mode="Markdown")
-
-
-async def show_mode(target, mode):
-    rows=[]
-    for x in MODES[mode]:
-        allowed = mode=="encode" or (x=="2K_AI" and entitlement_ok(target.from_user.id,"upscale_2k")) or (x=="4K_AI" and entitlement_ok(target.from_user.id,"upscale_4k")) or (x=="8K_AI" and entitlement_ok(target.from_user.id,"upscale_8k"))
-        if mode=="hybrid": allowed=entitlement_ok(target.from_user.id,"upscale_4k") or entitlement_ok(target.from_user.id,"upscale_8k")
-        label=x if allowed else f"🔒 {x}"
-        rows.append([(label,f"profile:{mode}:{x}")])
-    rows.append([('⬅️ Home','home'),('❌ Cancel','cancel')])
-    await target.edit_message_text(f"Select *{mode}* profile:",parse_mode="Markdown",reply_markup=kb(rows))
-
-
-async def menu(update, context, mode):
-    uid=update.effective_user.id
-    kind="encode" if mode=="encode" else None
+async def menu(client, message, mode):
+    uid=message.from_user.id
     if mode=="encode" and not entitlement_ok(uid,"encode"):
-        await update.message.reply_text("🔒 Encoding access not active. Choose Encoding — ₹300.",reply_markup=plan_keyboard()); return
-    if mode=="upscale" and not (entitlement_ok(uid,"upscale_2k") or entitlement_ok(uid,"upscale_4k") or entitlement_ok(uid,"upscale_8k")):
-        await update.message.reply_text("🔒 Upscale access not active. Choose a 2K/4K/8K plan.",reply_markup=plan_keyboard()); return
-    if mode=="hybrid" and not (entitlement_ok(uid,"upscale_4k") or entitlement_ok(uid,"upscale_8k")):
-        await update.message.reply_text("🔒 Hybrid requires 4K/8K Upscale access or Monthly Full Bot Access.",reply_markup=plan_keyboard()); return
-    await update.message.reply_text(f"Select *{mode}* profile:",parse_mode="Markdown",reply_markup=kb([[ (x,f"profile:{mode}:{x}") ] for x in MODES[mode]]+[[('⬅️ Home','home'),('❌ Cancel','cancel')]]))
+        await message.reply_text("Encoding access is not active.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    if mode=="upscale" and not any(entitlement_ok(uid,k) for k in ("upscale_2k","upscale_4k","upscale_8k")):
+        await message.reply_text("Upscale access is not active.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    if mode=="hybrid" and not any(entitlement_ok(uid,k) for k in ("upscale_4k","upscale_8k")):
+        await message.reply_text("Hybrid requires 4K or 8K access.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    await message.reply_text(f"Select {mode} profile:",reply_markup=kb([[(x,f"profile:{mode}:{x}")] for x in MODES[mode]]+[[('Home','home'),('Cancel','cancel')]]),**plain_kwargs())
 
 
-async def encode_cmd(u,c): await menu(u,c,"encode")
-async def upscale_cmd(u,c): await menu(u,c,"upscale")
-async def hybrid_cmd(u,c): await menu(u,c,"hybrid")
-
-
-async def callback(update, context):
-    q=update.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
-    if data=="home": await start_callback(q,context); return
-    if data=="cancel": context.user_data.clear(); await q.edit_message_text("❌ Cancelled."); return
-    if data in ("pay","paymenu"): await q.edit_message_text("💳 Select the service you want to purchase:",reply_markup=plan_keyboard()); return
-    if data=="support": await support_start(q,context); return
-    if data=="payments":
-        if is_owner(uid): await payments_callback(q,context)
-        return
-    if data=="support_inbox":
-        if is_owner(uid): await q.edit_message_text("📩 Support replies are sent with:\n`/reply REQUEST_ID your message`",parse_mode="Markdown")
-        return
-    if data=="health":
-        if is_owner(uid): await q.edit_message_text(f"VIKKY HEALTH\nffmpeg={bool(shutil.which('ffmpeg'))}\nffprobe={bool(shutil.which('ffprobe'))}\nDB={DB.exists()}\nworker={'external' if WORKER_CMD else 'MKV FFmpeg fallback'}\nowners={len(OWNER_IDS)}\noutput=MKV-only")
-        return
-    if data=="jobs":
-        if is_owner(uid): await jobs_callback(q,context)
-        return
-    if data.startswith("buy:"):
-        await show_payment_request(q,context,data.split(":",1)[1]); return
-    if data.startswith("qrreq:"): await request_qr(q,context,data.split(":",1)[1]); return
-    if data.startswith("qrapprove:"): await approve_qr(q,context,data.split(":",1)[1]); return
-    if data.startswith("qrreject:"): await reject_qr(q,context,data.split(":",1)[1]); return
-    if data.startswith("paid:"): await mark_paid(q,context,data.split(":",1)[1]); return
-    if data.startswith("paidapprove:"): await paid_approve(q,context,data.split(":",1)[1]); return
-    if data.startswith("grantplan:"):
-        _,pid,plan=data.split(":",2); await choose_grant_plan(q,context,pid,plan); return
+async def callback(client, q):
+    await q.answer(); uid=q.from_user.id; data=q.data or ""
+    if data=="home": await start_callback(q,client); return
+    if data=="cancel": await q.message.reply_text("Cancelled.", **plain_kwargs()); return
+    if data in ("pay","paymenu"): await q.edit_message_text("Select the service you want to purchase:",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    if data=="support": await support_start(q,client); return
+    if data.startswith("buy:"): await show_payment_request(q,client,data.split(":",1)[1]); return
+    if data.startswith("paid:"): await mark_paid(q,client,data.split(":",1)[1]); return
+    if data.startswith("paidapprove:"): await paid_approve(q,client,data.split(":",1)[1]); return
     if data.startswith("grantconfirm:"):
-        _,pid,plan=data.split(":",2); await confirm_grant(q,context,pid,plan); return
-    if data.startswith("paidreject:"): await paid_reject(q,context,data.split(":",1)[1]); return
-    if data.startswith("cmd:"):
-        mode=data.split(":",1)[1]
-        if mode=="encode" and not entitlement_ok(uid,"encode"): await q.edit_message_text("🔒 Encoding access required.",reply_markup=plan_keyboard()); return
-        if mode in ("upscale","hybrid") and not (entitlement_ok(uid,"upscale_2k") or entitlement_ok(uid,"upscale_4k") or entitlement_ok(uid,"upscale_8k")): await q.edit_message_text("🔒 Paid access required.",reply_markup=plan_keyboard()); return
-        await show_mode(q,mode); return
+        _,pid,plan=data.split(":",2); await confirm_grant(q,client,pid,plan); return
+    if data.startswith("paidreject:"): await paid_reject(q,client,data.split(":",1)[1]); return
+    if data=="health" and is_owner(uid):
+        await q.edit_message_text(f"VIKKY HEALTH\nffmpeg={bool(shutil.which('ffmpeg'))}\nffprobe={bool(shutil.which('ffprobe'))}\naria2c={bool(shutil.which('aria2c'))}\nyt-dlp={bool(shutil.which('yt-dlp'))}\nDB={DB.exists()}\nowners={len(OWNER_IDS)}\nHydrogram=enabled\nAIWorker={bool(AI_CMD or Path(REALESRGAN_DIR).exists())}", **plain_kwargs()); return
+    if data=="jobs" and is_owner(uid): await jobs_callback(q,client); return
+    if data=="payments" and is_owner(uid): await payments_callback(q,client); return
+    if data.startswith("cmd:"): await menu_callback(q,client,data.split(":",1)[1]); return
     if data.startswith("profile:"):
         _,mode,profile=data.split(":",2)
-        if not is_owner(uid):
-            needed="encode" if mode=="encode" else ("upscale_2k" if profile=="2K_AI" else "upscale_4k" if profile in ("4K_AI","4K_HYBRID") else "upscale_8k")
-            if not entitlement_ok(uid,needed): await q.edit_message_text("🔒 This profile is not included in your active purchase.",reply_markup=plan_keyboard()); return
-        context.user_data["selection"]={"mode":mode,"profile":profile}
-        await q.edit_message_text(f"Selected: *{profile}*\n\n📤 Send the source video/file now.\n\n⚠️ Final output is always `.mkv`.",parse_mode="Markdown",reply_markup=kb([[('⬅️ Back',f'cmd:{mode}'),('❌ Cancel','cancel')]])); return
+        needed="encode" if mode=="encode" else ("upscale_2k" if profile=="2K_AI" else "upscale_4k" if profile.startswith("4K") else "upscale_8k")
+        if not entitlement_ok(uid,needed): await q.edit_message_text("This profile is not included in your active purchase.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+        selections[uid] = {"mode":mode,"profile":profile}
+        await q.edit_message_text(f"Selected: {profile}\n\nSend the source video/file now.\nOr send a direct HTTP(S) video URL.\nFinal output: MKV.",reply_markup=kb([[('Back',f'cmd:{mode}'),('Cancel','cancel')]]),**plain_kwargs()); return
 
 
-async def start_callback(q,context):
+selections: dict[int, dict[str,str]] = {}
+
+async def start_callback(q,client):
+    if is_owner(q.from_user.id): await q.edit_message_text("OWNER / LIFETIME FREE\nEverything is unlocked.",reply_markup=owner_home_keyboard(),**plain_kwargs())
+    else: await q.edit_message_text("VIKKY Encoder\n\nChoose your service:",reply_markup=plan_keyboard(),**plain_kwargs())
+
+async def menu_callback(q,client,mode):
     uid=q.from_user.id
-    if is_owner(uid): await q.edit_message_text("👑 *OWNER / LIFETIME FREE*\n\nEverything is unlocked.",parse_mode="Markdown",reply_markup=owner_home_keyboard())
-    else: await q.edit_message_text("🎞️ *VIKKY Encoder*\n\n🏆 Best-quality encoding & AI upscaling\n🎞️ Final output: MKV only\n\nChoose your service:",parse_mode="Markdown",reply_markup=plan_keyboard())
+    if mode=="encode" and not entitlement_ok(uid,"encode"): await q.edit_message_text("Encoding access required.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    if mode=="upscale" and not any(entitlement_ok(uid,k) for k in ("upscale_2k","upscale_4k","upscale_8k")): await q.edit_message_text("Paid access required.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    if mode=="hybrid" and not any(entitlement_ok(uid,k) for k in ("upscale_4k","upscale_8k")): await q.edit_message_text("4K/8K access required.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    await q.edit_message_text(f"Select {mode} profile:",reply_markup=kb([[(x,f"profile:{mode}:{x}")] for x in MODES[mode]]+[[('Home','home'),('Cancel','cancel')]]),**plain_kwargs())
 
-async def payments_callback(q,context):
+async def payments_callback(q,client):
     c=db(); rows=c.execute("SELECT id,uid,plan,status FROM payments ORDER BY created DESC LIMIT 20").fetchall(); c.close()
-    if not rows: await q.edit_message_text("💳 No payment requests.",reply_markup=owner_home_keyboard()); return
-    rowsbtn=[]
-    for r in rows:
-        rowsbtn.append([(f"{r['id']} • {r['status']}",f"pview:{r['id']}")])
-    rowsbtn.append([('⬅️ Owner','home')]); await q.edit_message_text("💳 Payment Requests",reply_markup=kb(rowsbtn))
+    if not rows: await q.edit_message_text("No payment requests.",reply_markup=owner_home_keyboard(),**plain_kwargs()); return
+    await q.edit_message_text("Payment Requests\n\n"+"\n".join(f"{r['id']} | {r['uid']} | {r['plan']} | {r['status']}" for r in rows),reply_markup=owner_home_keyboard(),**plain_kwargs())
 
-async def jobs_callback(q,context):
+async def jobs_callback(q,client):
     c=db(); rows=c.execute("SELECT id,uid,mode,profile,status,progress FROM jobs ORDER BY created DESC LIMIT 30").fetchall(); c.close()
-    await q.edit_message_text("\n".join(f"{x['id'][:8]} | {x['uid']} | {x['mode']} | {x['profile']} | {x['status']} | {x['progress']}%" for x in rows) or "No jobs.",reply_markup=owner_home_keyboard())
+    text="\n".join(f"{x['id'][:8]} | {x['uid']} | {x['mode']} | {x['profile']} | {x['status']} | {x['progress']}%" for x in rows) or "No jobs."
+    await q.edit_message_text(text,reply_markup=owner_home_keyboard(),**plain_kwargs())
 
 
-async def media(update, context):
-    if await proof_media(update,context): return
-    if await support_message(update,context): return
-    uid=update.effective_user.id
-    sel=context.user_data.get("selection")
-    if not sel: return
+async def quota(client,message):
+    uid=message.from_user.id
+    if is_owner(uid): await message.reply_text("Owner: unlimited quota.",**plain_kwargs()); return
+    c=db(); u=quota_usage(c,uid); c.close(); used=u["used_bytes"]/1024**3; remain=max(0,WEEKLY_QUOTA_GB-used)
+    await message.reply_text(f"Weekly quota\n\nReset: Saturday 00:00 Asia/Kolkata\nUsed: {used:.2f} GB / {WEEKLY_QUOTA_GB:.2f} GB\nRemaining: {remain:.2f} GB\nTasks: {u['used_tasks']} / {WEEKLY_QUOTA_TASKS}",**plain_kwargs())
+
+
+async def accept_job(client, message, local_path: Path, sel: dict[str,str]):
+    uid=message.from_user.id; size=local_path.stat().st_size
+    if size > MAX_INPUT_GB*1024**3: raise RuntimeError(f"Input exceeds {MAX_INPUT_GB:g} GB ceiling")
     if not is_owner(uid):
-        needed="encode" if sel["mode"]=="encode" else ("upscale_2k" if sel["profile"]=="2K_AI" else "upscale_4k" if sel["profile"] in ("4K_AI","4K_HYBRID") else "upscale_8k")
-        if not entitlement_ok(uid,needed): await update.message.reply_text("🔒 This profile is not included in your active purchase."); return
-    obj=update.message.document or update.message.video
-    if not obj: return
-    name=getattr(obj,"file_name",None) or f"video_{getattr(obj,'file_unique_id',uuid.uuid4().hex)}"; size=int(getattr(obj,"file_size",0) or 0)
-    if size>MAX_INPUT_GB*1024**3: await update.message.reply_text(f"❌ Input exceeds {MAX_INPUT_GB:g} GB configured ceiling."); return
-    jid=uuid.uuid4().hex; work=TEMP/jid; work.mkdir(parents=True,exist_ok=True); path=work/(safe_name(name)+Path(name).suffix.lower())
-    await update.message.reply_text(f"📥 `{jid[:8]}` accepted.\n⏳ Downloading…",parse_mode="Markdown")
-    try:
-        tg=await context.bot.get_file(obj.file_id); await tg.download_to_drive(custom_path=str(path)); meta=ffprobe(path)
-        if not meta: raise RuntimeError("FFprobe could not read the media.")
-        now=int(time.time()); duration=float(meta.get("format",{}).get("duration") or 0); fsize=path.stat().st_size
-        c=db(); c.execute("INSERT INTO jobs(id,uid,mode,profile,status,progress,input,output,error,created,updated,duration,size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(jid,uid,sel["mode"],sel["profile"],"queued",0,str(path),"","",now,now,duration,fsize)); c.commit(); c.close(); event(jid,uid,"queued")
-        await update.message.reply_text(f"🟢 `{jid[:8]}` queued.\n🔴 Live processing updates will follow.",parse_mode="Markdown")
-        asyncio.create_task(run_job(context.application,jid))
-    except Exception as e:
-        shutil.rmtree(work,ignore_errors=True); await update.message.reply_text(f"❌ Input failed: {str(e)[:1000]}")
+        c=db(); allowed=quota_can_consume(c,uid,size,int(WEEKLY_QUOTA_GB*1024**3),WEEKLY_QUOTA_TASKS); usage=quota_usage(c,uid); c.close()
+        if not allowed: raise RuntimeError(f"Weekly quota exhausted. Used {usage['used_bytes']/1024**3:.2f} GB / {WEEKLY_QUOTA_GB:.2f} GB")
+    meta=ffprobe(local_path)
+    if not meta: raise RuntimeError("FFprobe could not read the media")
+    duration=float(meta.get("format",{}).get("duration") or 0); jid=uuid.uuid4().hex
+    now=int(time.time())
+    c=db(); c.execute("INSERT INTO jobs(id,uid,mode,profile,status,progress,input,output,error,created,updated,duration,size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(jid,uid,sel["mode"],sel["profile"],"queued",0,str(local_path),"","",now,now,duration,size)); c.commit(); c.close(); event(jid,uid,"queued")
+    await message.reply_text(f"Queued {jid[:8]}. Processing will start automatically.",**plain_kwargs())
+    schedule_job(client,jid)
 
+
+async def media(client,message):
+    if await proof_media(client,message): return
+    if await support_message(client,message): return
+    uid=message.from_user.id; sel=selections.get(uid)
+    if not sel: return
+    if not entitlement_ok(uid,"encode" if sel["mode"]=="encode" else ("upscale_2k" if sel["profile"]=="2K_AI" else "upscale_4k" if sel["profile"].startswith("4K") else "upscale_8k")):
+        await message.reply_text("This profile is not included in your active purchase.",**plain_kwargs()); return
+    work=TEMP/f"input_{uuid.uuid4().hex}"; work.mkdir(parents=True,exist_ok=True)
+    try:
+        if message.document or message.video:
+            obj=message.document or message.video
+            name=getattr(obj,"file_name",None) or f"video_{message.id}.mkv"
+            dest=work/(safe_name(name) + ("" if Path(name).suffix else ".mkv"))
+            await message.download(file_name=str(dest))
+        else:
+            url=extract_url(message.text or message.caption)
+            if not url: return
+            dest=work/"input.mkv"
+            await message.reply_text("Downloading URL... aria2c first, yt-dlp fallback.",**plain_kwargs())
+            status_msg = await message.reply_text("Download starting...", **plain_kwargs())
+            async def _download_status(text: str):
+                try:
+                    await client.edit_message_text(message.chat.id, status_msg.id, text, **plain_kwargs())
+                except Exception:
+                    pass
+            await download_url(
+                url,
+                dest,
+                max_bytes=int(MAX_INPUT_GB*1024**3),
+                progress_cb=_download_status,
+            )
+        await accept_job(client,message,dest,sel)
+    except Exception as e:
+        shutil.rmtree(work,ignore_errors=True)
+        await message.reply_text(f"Input failed: {str(e)[:1200]}",**plain_kwargs())
+
+
+def progress_from_ffmpeg(line: str, duration: float):
+    m=re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)",line)
+    if m and duration:
+        sec=int(m.group(1))*3600+int(m.group(2))*60+float(m.group(3))
+        return max(5,min(98,int(sec/duration*90)+5))
+    m=re.search(r"(?<!\d)(\d{1,3})%(?!\d)", line)
+    if m:
+        return max(1,min(99,int(m.group(1))))
+    return None
 
 async def set_progress(jid,pct):
     c=db(); c.execute("UPDATE jobs SET progress=?,updated=? WHERE id=?",(max(0,min(99,int(pct))),int(time.time()),jid)); c.commit(); c.close()
 
-def progress_from_ffmpeg(line,duration):
-    m=re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)",line)
-    if not m or not duration:return None
-    sec=int(m.group(1))*3600+int(m.group(2))*60+float(m.group(3)); return max(5,min(98,int(sec/duration*90)+5))
+
+def build_ffmpeg_command(inp: Path, out: Path, profile: str):
+    return ["ffmpeg","-hide_banner","-y","-i",str(inp),"-map","0","-c:v","libx265","-preset","medium","-crf","18","-pix_fmt","yuv420p10le","-c:a","copy","-c:s","copy","-c:d","copy","-f","matroska",str(out)]
 
 
-async def run_job(app,jid):
-    c=db(); r=c.execute("SELECT * FROM jobs WHERE id=?",(jid,)).fetchone(); c.close()
-    if not r:return
-    inp=Path(r["input"]); out=OUT/f"{safe_name(inp.name)}.{r['profile']}.By.VIKKY.mkv"; out=out.with_suffix('.mkv')
-    await set_progress(jid,2); event(jid,r["uid"],"processing")
+def build_ai_command(inp: Path, out: Path, profile: str):
+    import shlex
+    if AI_CMD:
+        return AI_CMD.format(input=str(inp), output=str(out), mode="upscale", profile=profile)
+    return " ".join([
+        shlex.quote(sys.executable), shlex.quote(str(BASE / 'workers' / 'ai_worker.py')),
+        '--input', shlex.quote(str(inp)), '--output', shlex.quote(str(out)),
+        '--profile', shlex.quote(profile), '--realesrgan-dir', shlex.quote(REALESRGAN_DIR),
+    ])
+
+def load_uploader_functions():
     try:
-        duration=float(r["duration"] or 0)
-        if WORKER_CMD: cmd=WORKER_CMD.format(input=str(inp),output=str(out),mode=r["mode"],profile=r["profile"])
-        else: cmd=f'ffmpeg -hide_banner -y -i "{inp}" -map 0 -c:v libx265 -preset medium -crf 18 -pix_fmt yuv420p10le -c:a copy -c:s copy -c:d copy -f matroska "{out}"'
-        proc=await asyncio.create_subprocess_shell(cmd,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.STDOUT)
-        last=0; last_live=0
-        while True:
-            raw=await proc.stdout.readline()
-            if not raw:break
-            line=raw.decode('utf-8','ignore').strip(); pct=progress_from_ffmpeg(line,duration)
-            if pct is not None: await set_progress(jid,pct); last=pct
-            if time.time()-last_live>=LIVE_INTERVAL:
-                last_live=time.time(); await app.bot.send_message(r["uid"],f"⚙️ `{jid[:8]}` {r['mode']} / {r['profile']}\n📈 Progress: {last or 5}%\n🎯 Output: MKV only",parse_mode='Markdown')
-        rc=await proc.wait()
-        if rc!=0 or not out.exists() or out.stat().st_size==0:raise RuntimeError(f"Worker/FFmpeg failed with exit code {rc}")
-        if out.suffix.lower()!='.mkv':raise RuntimeError('Safety check failed: output is not MKV.')
-        meta=ffprobe(out); digest=sha256(out); report=REPORTS/f"{jid}.json"
-        report.write_text(json.dumps({"job_id":jid,"status":"done","output":out.name,"bytes":out.stat().st_size,"sha256":digest,"media":meta,"verified_mkv":True},indent=2),encoding='utf-8')
-        c=db(); c.execute("UPDATE jobs SET status='done',progress=100,output=?,sha256=?,size=?,updated=? WHERE id=?",(str(out),digest,out.stat().st_size,int(time.time()),jid)); c.commit(); c.close(); event(jid,r["uid"],'done')
-        await app.bot.send_message(r["uid"],f"✅ `{jid[:8]}` COMPLETE\n📦 `{out.name}`\n🎞️ MKV verified\n🔐 SHA256 `{digest}`",parse_mode='Markdown')
-        if out.stat().st_size<=50*1024*1024: await app.bot.send_document(r["uid"],document=str(out),caption=f"🎬 {out.name}")
-        else: await app.bot.send_message(r["uid"],"📦 Verified MKV is larger than Telegram cloud-bot upload limit. Keep/use the configured external uploader or storage worker for delivery.")
-    except Exception as e:
-        c=db(); c.execute("UPDATE jobs SET status='failed',error=?,updated=? WHERE id=?",(str(e)[:2000],int(time.time()),jid)); c.commit(); c.close(); event(jid,r["uid"],f'failed: {e}')
-        await app.bot.send_message(r["uid"],f"❌ `{jid[:8]}` FAILED\n{str(e)[:1200]}",parse_mode='Markdown')
+        manager=importlib.import_module("uploaders.manager")
+        upload=getattr(manager,"upload_with_fallback")
+    except Exception:
+        upload=None
+    try:
+        delivery=importlib.import_module("uploaders.delivery")
+    except Exception:
+        delivery=None
+    return upload, delivery
 
-
-async def grant(update,context):
-    if not is_owner(update.effective_user.id):return
-    if len(context.args)<2:await update.message.reply_text('/grant USER_ID DAYS PLAN_CODE');return
-    uid=int(context.args[0]);days=int(context.args[1]);plan=context.args[2] if len(context.args)>2 else 'ALL_2500'
-    if plan not in PLANS:await update.message.reply_text('❌ Unknown plan.');return
-    until=int(time.time())+days*86400;touch_user(uid);c=db();c.execute('INSERT OR REPLACE INTO entitlements(uid,plan,until) VALUES(?,?,?)',(uid,plan,until));c.execute('UPDATE users SET access_until=MAX(access_until,?) WHERE uid=?',(until,uid));c.commit();c.close();await update.message.reply_text(f'✅ Granted {PLANS[plan]["label"]} for {days} days.')
-
-async def revoke(update,context):
-    if not is_owner(update.effective_user.id):return
-    if not context.args:await update.message.reply_text('/revoke USER_ID [PLAN_CODE]');return
-    uid=int(context.args[0]);c=db()
-    if len(context.args)>1:c.execute('DELETE FROM entitlements WHERE uid=? AND plan=?',(uid,context.args[1]))
-    else:c.execute('DELETE FROM entitlements WHERE uid=?',(uid,))
-    c.commit();c.close();await update.message.reply_text('✅ Access revoked.')
-
-async def uploader(update,context):
-    if not is_owner(update.effective_user.id):return
-    if len(context.args)<2:await update.message.reply_text('/uploader USER_ID on|off');return
-    c=db();c.execute('INSERT OR IGNORE INTO users(uid,created) VALUES(?,?)',(int(context.args[0]),int(time.time())));c.execute('UPDATE users SET uploader=? WHERE uid=?',(1 if context.args[1].lower()=='on' else 0,int(context.args[0])));c.commit();c.close();await update.message.reply_text('✅ Uploader flag updated.')
-
-async def health(update,context):
-    if not is_owner(update.effective_user.id):return
-    await update.message.reply_text(f"VIKKY HEALTH\nffmpeg={bool(shutil.which('ffmpeg'))}\nffprobe={bool(shutil.which('ffprobe'))}\nDB={DB.exists()}\nQR={QR_PATH.exists()}\nworker={'external' if WORKER_CMD else 'MKV FFmpeg fallback'}\nowners={len(OWNER_IDS)}\noutput=MKV-only")
-
-async def jobs(update,context):
-    if not is_owner(update.effective_user.id):return
-    c=db();rows=c.execute('SELECT id,uid,mode,profile,status,progress FROM jobs ORDER BY created DESC LIMIT 30').fetchall();c.close();await update.message.reply_text('\n'.join(f"{x['id'][:8]} | {x['uid']} | {x['mode']} | {x['profile']} | {x['status']} | {x['progress']}%" for x in rows) or 'No jobs.')
-
-async def retry(update,context):
-    if not is_owner(update.effective_user.id) or not context.args:return
-    jid=context.args[0];c=db();r=c.execute('SELECT uid FROM jobs WHERE id=?',(jid,)).fetchone()
-    if not r:c.close();await update.message.reply_text('❌ Job not found.');return
-    c.execute("UPDATE jobs SET status='queued',progress=0,error='',updated=? WHERE id=?",(int(time.time()),jid));c.commit();c.close();asyncio.create_task(run_job(context.application,jid));await update.message.reply_text('🔁 Job requeued.')
-
-async def cancel(update,context):
-    uid=update.effective_user.id
-    if not context.args:await update.message.reply_text('/cancel JOB_ID');return
-    jid=context.args[0];c=db();r=c.execute('SELECT uid,status FROM jobs WHERE id=?',(jid,)).fetchone()
-    if not r or (r['uid']!=uid and not is_owner(uid)):c.close();await update.message.reply_text('❌ Not allowed / not found.');return
-    c.execute("UPDATE jobs SET status='cancelled',updated=? WHERE id=?",(int(time.time()),jid));c.commit();c.close();await update.message.reply_text('🛑 Job marked cancelled.')
-
-async def cleanup_loop(app):
-    # Bot API does not expose read receipts to bots. We therefore use a conservative 24h expiry for support chat messages.
-    while True:
-        try:
-            cutoff=int(time.time())-CONTACT_DELETE_HOURS*3600
-            c=db(); rows=c.execute('SELECT id,uid,owner_message_ids FROM support_requests WHERE updated<? AND status NOT IN (\'deleted\',)',(cutoff,)).fetchall()
-            for r in rows:
-                try:
-                    await app.bot.delete_message(r['uid'], int(r['owner_message_ids'])) if r['owner_message_ids'].isdigit() else None
-                except Exception: pass
-                c.execute("UPDATE support_requests SET status='deleted',updated=? WHERE id=?",(int(time.time()),r['id']))
-            c.commit();c.close()
+async def deliver(client, jid, uid, out: Path, digest: str):
+    upload, delivery = load_uploader_functions()
+    if not upload:
+        raise RuntimeError("uploaders.manager.upload_with_fallback is not available")
+    result = await asyncio.to_thread(upload, str(out))
+    if asyncio.iscoroutine(result): result = await result
+    if isinstance(result, dict):
+        url=result.get("url") or result.get("link") or result.get("download_url")
+        provider=result.get("provider") or result.get("name") or "unknown"
+    elif isinstance(result,(tuple,list)) and len(result)>=2:
+        provider,url=result[0],result[1]
+    else:
+        provider="external"; url=str(result)
+    if not url or not re.match(r"^https?://",url): raise RuntimeError("Uploader returned an invalid URL")
+    now=int(time.time()); c=db(); c.execute("INSERT INTO deliveries(job_id,uid,provider,url,status,created) VALUES(?,?,?,?,?,?)",(jid,uid,str(provider),url,"sent",now)); c.commit(); c.close()
+    text=f"Result ready\nProvider: {provider}\nDownload: {url}\nJob: {jid[:8]}\nSHA256: {digest}"
+    if delivery:
+        fn=getattr(delivery,"deliver_result",None)
+        if fn:
+            try:
+                r=fn(client,uid,CHANNEL_ID,text,job_id=jid,provider=provider,url=url)
+                if asyncio.iscoroutine(r): await r
+                return url
+            except TypeError:
+                pass
+    await client.send_message(uid,text,**plain_kwargs())
+    if CHANNEL_ID:
+        try: await client.send_message(CHANNEL_ID,text,**plain_kwargs())
         except Exception: pass
-        await asyncio.sleep(3600)
+    return url
 
-async def error_handler(update,context):print('BOT_ERROR',repr(context.error))
 
-async def post_init(app):
-    asyncio.create_task(cleanup_loop(app))
+async def run_job(client,jid):
+    if jid in active_jobs: return
+    active_jobs.add(jid)
+    async with worker_sem:
+        c=db(); r=c.execute("SELECT * FROM jobs WHERE id=?",(jid,)).fetchone(); c.close()
+        if not r: active_jobs.discard(jid); return
+        inp=Path(r["input"]); out=OUT/f"{safe_name(inp.name)}.{r['profile']}.By.VIKKY.mkv"
+        try:
+            c=db(); c.execute("UPDATE jobs SET status='processing',progress=2,updated=? WHERE id=?",(int(time.time()),jid)); c.commit(); c.close(); event(jid,r["uid"],"processing")
+            duration=float(r["duration"] or 0)
+            is_ai = r["profile"].endswith("_AI") or r["profile"].endswith("_HYBRID")
+            if is_ai:
+                cmd=build_ai_command(inp,out,r["profile"])
+                proc=await asyncio.create_subprocess_shell(cmd,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.STDOUT)
+            elif WORKER_CMD:
+                cmd=WORKER_CMD.format(input=str(inp),output=str(out),mode=r["mode"],profile=r["profile"])
+                proc=await asyncio.create_subprocess_shell(cmd,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.STDOUT)
+            else:
+                proc=await asyncio.create_subprocess_exec(*build_ffmpeg_command(inp,out,r["profile"]),stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.STDOUT)
+            status_msg=None; last=5; last_live=0; last_line=''
+            try:
+                status_msg=await client.send_message(r["uid"],f"Job {jid[:8]}\n{r['mode']} / {r['profile']}\nStarting...",**plain_kwargs())
+            except Exception:
+                pass
+            while True:
+                raw=await proc.stdout.readline()
+                if not raw: break
+                line=raw.decode("utf-8","ignore").strip(); last_line=line[-300:]
+                pct=progress_from_ffmpeg(line,duration)
+                if pct:
+                    last=pct; await set_progress(jid,pct)
+                cc=db(); cr=cc.execute("SELECT status FROM jobs WHERE id=?",(jid,)).fetchone(); cc.close()
+                if cr and cr["status"]=="cancelled":
+                    try: proc.terminate()
+                    except Exception: pass
+                    raise RuntimeError("Job cancelled by user")
+                if status_msg and time.time()-last_live>=LIVE_INTERVAL:
+                    last_live=time.time()
+                    try:
+                        await client.edit_message_text(r["uid"],status_msg.id,f"Job {jid[:8]}\n{r['mode']} / {r['profile']}\nProgress: {last}%\nEngine: {'AI/GPU' if is_ai else 'FFmpeg'}",**plain_kwargs())
+                    except Exception: pass
+            rc=await proc.wait()
+            if rc!=0 or not out.exists() or out.stat().st_size==0: raise RuntimeError(f"Processing worker failed with exit code {rc}. Last output: {last_line}")
+            if status_msg:
+                try: await client.edit_message_text(r["uid"],status_msg.id,f"Job {jid[:8]}\nProcessing complete. Validating MKV...",**plain_kwargs())
+                except Exception: pass
+            meta=ffprobe(out)
+            if not meta: raise RuntimeError("Output validation failed")
+            digest=sha256(out); size=out.stat().st_size
+            report=REPORTS/f"{jid}.json"; report.write_text(json.dumps({"job_id":jid,"output":str(out),"bytes":size,"sha256":digest,"media":meta,"verified_mkv":out.suffix.lower()=='.mkv'},indent=2),encoding="utf-8")
+            c=db(); c.execute("UPDATE jobs SET status='uploading',progress=99,output=?,sha256=?,size=?,updated=? WHERE id=?",(str(out),digest,size,int(time.time()),jid)); c.commit(); c.close()
+            await deliver(client,jid,r["uid"],out,digest)
+            if not is_owner(r["uid"]):
+                c=db(); quota_consume(c,r["uid"],size); c.close()
+            c=db(); c.execute("UPDATE jobs SET status='done',progress=100,updated=? WHERE id=?",(int(time.time()),jid)); c.commit(); c.close(); event(jid,r["uid"],"done")
+            await client.send_message(r["uid"],f"Job {jid[:8]} complete. External result link has been sent.",**plain_kwargs())
+        except Exception as e:
+            c=db(); c.execute("UPDATE jobs SET status='failed',error=?,updated=? WHERE id=?",(str(e)[:2000],int(time.time()),jid)); c.commit(); c.close(); event(jid,r["uid"],f"failed: {e}")
+            try: await client.send_message(r["uid"],f"Job {jid[:8]} failed.\n{str(e)[:1200]}",**plain_kwargs())
+            except Exception: pass
+        finally:
+            active_jobs.discard(jid)
+            try:
+                c = db(); final = c.execute("SELECT status FROM jobs WHERE id=?", (jid,)).fetchone(); c.close()
+                final_status = final["status"] if final else "failed"
+                if final_status in ("done", "cancelled"):
+                    if inp.parent.name.startswith("input_"): shutil.rmtree(inp.parent, ignore_errors=True)
+                    if out.exists(): out.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def schedule_job(client,jid):
+    if jid in active_jobs: return
+    task=asyncio.create_task(run_job(client,jid)); worker_tasks.add(task); task.add_done_callback(worker_tasks.discard)
+
+async def recover_queued_jobs(client):
+    c=db(); rows=c.execute("SELECT id FROM jobs WHERE status IN ('queued','processing','uploading') ORDER BY created ASC").fetchall(); c.close()
+    for r in rows: schedule_job(client,r["id"])
+
+async def grant(client,message):
+    if not is_owner(message.from_user.id): return
+    args=message.text.split() if message.text else []
+    if len(args)<3: await message.reply_text("Usage: /grant USER_ID DAYS PLAN_CODE",**plain_kwargs()); return
+    uid=int(args[1]); days=int(args[2]); plan=args[3] if len(args)>3 else "ALL_2500"
+    if plan not in PLANS: await message.reply_text("Unknown plan.",**plain_kwargs()); return
+    until=int(time.time())+days*86400; touch_user(uid); c=db(); c.execute("INSERT OR REPLACE INTO entitlements(uid,plan,until) VALUES(?,?,?)",(uid,plan,until)); c.execute("UPDATE users SET access_until=MAX(access_until,?) WHERE uid=?",(until,uid)); c.commit(); c.close(); await message.reply_text(f"Granted {PLANS[plan]['label']} for {days} days.",**plain_kwargs())
+
+async def revoke(client,message):
+    if not is_owner(message.from_user.id): return
+    args=message.text.split() if message.text else []
+    if len(args)<2: await message.reply_text("Usage: /revoke USER_ID [PLAN_CODE]",**plain_kwargs()); return
+    uid=int(args[1]); c=db();
+    if len(args)>2: c.execute("DELETE FROM entitlements WHERE uid=? AND plan=?",(uid,args[2]))
+    else: c.execute("DELETE FROM entitlements WHERE uid=?",(uid,))
+    c.commit(); c.close(); await message.reply_text("Access revoked.",**plain_kwargs())
+
+async def status(client,message):
+    uid=message.from_user.id; touch_user(uid)
+    if is_owner(uid): await message.reply_text("Owner - lifetime FREE access.",**plain_kwargs()); return
+    c=db(); rows=c.execute("SELECT plan,until FROM entitlements WHERE uid=? AND until>?",(uid,int(time.time()))).fetchall(); c.close()
+    if not rows: await message.reply_text("No active paid access.",reply_markup=plan_keyboard(),**plain_kwargs()); return
+    await message.reply_text("Active services:\n"+"\n".join(f"{PLANS[r['plan']]['label']} until {datetime.fromtimestamp(r['until'],timezone.utc).date().isoformat()}" for r in rows),**plain_kwargs())
+
+async def jobs_cmd(client,message):
+    if not is_owner(message.from_user.id): return
+    c=db(); rows=c.execute("SELECT id,uid,mode,profile,status,progress FROM jobs ORDER BY created DESC LIMIT 30").fetchall(); c.close(); await message.reply_text("\n".join(f"{x['id'][:8]} | {x['uid']} | {x['mode']} | {x['profile']} | {x['status']} | {x['progress']}%" for x in rows) or "No jobs.",**plain_kwargs())
+
+async def retry(client,message):
+    if not is_owner(message.from_user.id): return
+    args=message.text.split() if message.text else []
+    if len(args)<2: return
+    jid=args[1]; c=db(); r=c.execute("SELECT id FROM jobs WHERE id=?",(jid,)).fetchone();
+    if not r: c.close(); await message.reply_text("Job not found.",**plain_kwargs()); return
+    c.execute("UPDATE jobs SET status='queued',progress=0,error='',updated=? WHERE id=?",(int(time.time()),jid)); c.commit(); c.close(); schedule_job(client,jid); await message.reply_text("Job requeued.",**plain_kwargs())
+
+async def cancel(client,message):
+    args=message.text.split() if message.text else []
+    if len(args)<2: await message.reply_text("Usage: /cancel JOB_ID",**plain_kwargs()); return
+    jid=args[1]; uid=message.from_user.id; c=db(); r=c.execute("SELECT uid FROM jobs WHERE id=?",(jid,)).fetchone()
+    if not r or (r["uid"]!=uid and not is_owner(uid)): c.close(); await message.reply_text("Not allowed / not found.",**plain_kwargs()); return
+    c.execute("UPDATE jobs SET status='cancelled',updated=? WHERE id=?",(int(time.time()),jid)); c.commit(); c.close(); await message.reply_text("Job cancelled.",**plain_kwargs())
+
+async def health(client,message):
+    if not is_owner(message.from_user.id): return
+    await message.reply_text(f"VIKKY HEALTH\nffmpeg={bool(shutil.which('ffmpeg'))}\nffprobe={bool(shutil.which('ffprobe'))}\naria2c={bool(shutil.which('aria2c'))}\nyt-dlp={bool(shutil.which('yt-dlp'))}\nDB={DB.exists()}\nHydrogram=enabled\nOwners={len(OWNER_IDS)}",**plain_kwargs())
+
+async def error_handler(client, update, error):
+    print("BOT_ERROR", repr(error))
+
+
+def build_app():
+    app=Client(
+        "vikky_encoder",
+        api_id=int(API_ID),
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        parse_mode=enums.ParseMode.DISABLED,
+    )
+    app.set_parse_mode(enums.ParseMode.DISABLED)
+    for command, fn in {
+        "start":start,"pay":pay,"encode":lambda c,m:menu(c,m,"encode"),"upscale":lambda c,m:menu(c,m,"upscale"),"hybrid":lambda c,m:menu(c,m,"hybrid"),
+        "status":status,"quota":quota,"grant":grant,"revoke":revoke,"jobs":jobs_cmd,"retry":retry,"cancel":cancel,"health":health,"support":support_cmd,"reply":reply_support,
+    }.items():
+        app.add_handler(MessageHandler(fn, filters.command(command)))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(media, filters.photo | filters.document | filters.video))
+    app.add_handler(MessageHandler(media, filters.text & ~filters.command("start")))
+    return app
+
 
 def main():
-    if not BOT_TOKEN:raise SystemExit('BOT_TOKEN is missing; use environment/GitHub Secrets.')
-    if len(OWNER_IDS)!=2:raise SystemExit('Set exactly two OWNER_IDS.')
-    init_db();app=Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    for cmd,fn in [("start",start),("encode",encode_cmd),("upscale",upscale_cmd),("hybrid",hybrid_cmd),("pay",pay),("status",status),("grant",grant),("revoke",revoke),("uploader",uploader),("health",health),("jobs",jobs),("retry",retry),("cancel",cancel),("reply",reply_support),("payments",payments)]:app.add_handler(CommandHandler(cmd,fn))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO,media))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,media))
-    app.add_error_handler(error_handler)
-    print(f'{APP} running | MKV-only | manual payment verification | persistent SQLite queue')
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if not BOT_TOKEN: raise SystemExit("BOT_TOKEN is missing; use environment/GitHub Secrets.")
+    if not API_ID or not API_HASH: raise SystemExit("API_ID/API_HASH are required by Hydrogram; keep them in environment/GitHub Secrets.")
+    if len(OWNER_IDS)!=2: raise SystemExit("Set exactly two OWNER_IDS.")
+    init_db()
+    backoff=5
+    while True:
+        app=build_app()
+        async def runner():
+            await app.start()
+            await recover_queued_jobs(app)
+            print(f"{APP} running | Hydrogram | Python 3.14 | MKV-only | persistent SQLite queue")
+            try:
+                await idle()
+            finally:
+                await app.stop()
+        try:
+            asyncio.run(runner())
+            backoff=5
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            print("BOT_RUNTIME_RESTART", repr(exc), flush=True)
+            time.sleep(backoff)
+            backoff=min(backoff*2, 60)
 
-if __name__=='__main__':main()
+if __name__=="__main__":
+    main()

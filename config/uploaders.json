@@ -1,19 +1,19 @@
 {
-  "providers": [
-    {"name":"Cloudflare R2","type":"s3_compatible","enabled":false},
-    {"name":"Backblaze B2","type":"s3_compatible","enabled":false},
-    {"name":"Wasabi","type":"s3_compatible","enabled":false},
-    {"name":"Google Drive","type":"oauth","enabled":false},
-    {"name":"Microsoft OneDrive","type":"oauth","enabled":false},
-    {"name":"Amazon S3","type":"s3","enabled":false},
-    {"name":"Azure Blob","type":"azure","enabled":false},
-    {"name":"Google Cloud Storage","type":"gcs","enabled":false},
-    {"name":"DigitalOcean Spaces","type":"s3_compatible","enabled":false},
-    {"name":"Cloudinary","type":"api","enabled":false},
-    {"name":"Pixeldrain","type":"api","enabled":false},
-    {"name":"Dropbox","type":"oauth","enabled":false},
-    {"name":"Box","type":"oauth","enabled":false},
-    {"name":"pCloud","type":"api","enabled":false},
-    {"name":"Filebase","type":"s3_compatible","enabled":false}
+  "slots": [
+    {"name": "buzzheavier", "enabled": true, "guest": true, "max_bytes": 64424509440},
+    {"name": "storage_to", "enabled": true, "guest": true, "max_bytes": 26843545600},
+    {"name": "gofile", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "pixeldrain", "enabled": false, "guest": false, "max_bytes": 0},
+    {"name": "catbox", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "litterbox", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "filebin", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "file_io", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "transfer_sh", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "temp_sh", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "gofile_2", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "mirror_12", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "mirror_13", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "mirror_14", "enabled": false, "guest": true, "max_bytes": 0},
+    {"name": "mirror_15", "enabled": false, "guest": true, "max_bytes": 0}
   ]
 }

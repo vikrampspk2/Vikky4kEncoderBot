@@ -1,0 +1,113 @@
+import json
+from pathlib import Path
+from typing import Any
+
+from .adapters import UploadError, upload_provider
+
+BASE = Path(__file__).resolve().parent.parent
+CONFIG = BASE / "config" / "uploaders.json"
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG.exists():
+        return {"providers": []}
+
+    try:
+        data = json.loads(CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"providers": []}
+
+        providers = data.get("providers", [])
+        if not isinstance(providers, list):
+            providers = []
+
+        data["providers"] = providers
+        return data
+
+    except Exception as exc:
+        print(f"UPLOADER_CONFIG_ERROR: {exc}")
+        return {"providers": []}
+
+
+def enabled_providers() -> list[dict[str, Any]]:
+    result = []
+
+    for provider in load_config()["providers"]:
+        if not isinstance(provider, dict):
+            continue
+
+        if not provider.get("enabled", False):
+            continue
+
+        name = str(provider.get("name", "")).strip()
+        if not name:
+            continue
+
+        result.append({
+            **provider,
+            "name": name,
+            "priority": int(provider.get("priority", 999)),
+        })
+
+    result.sort(key=lambda x: x["priority"])
+    return result
+
+
+def provider_names() -> list[str]:
+    return [p["name"] for p in enabled_providers()]
+
+
+def upload_with_fallback(path: str) -> dict[str, Any]:
+    providers = enabled_providers()
+
+    if not providers:
+        raise UploadError("No uploader providers are enabled.")
+
+    failures = []
+
+    for provider in providers:
+        name = provider["name"]
+        attempts = max(1, int(provider.get("attempts", 2)))
+
+        for attempt in range(1, attempts + 1):
+            print(
+                f"UPLOADER_TRY: provider={name} "
+                f"attempt={attempt}/{attempts}"
+            )
+
+            try:
+                url = upload_provider(provider, path)
+
+                if not isinstance(url, str):
+                    raise UploadError("Provider returned a non-string URL.")
+
+                url = url.strip()
+
+                if not url.startswith(("https://", "http://")):
+                    raise UploadError("Provider returned an invalid URL.")
+
+                print(f"UPLOADER_SUCCESS: provider={name}")
+
+                return {
+                    "provider": name,
+                    "url": url,
+                    "attempt": attempt,
+                }
+
+            except Exception as exc:
+                message = str(exc)[:1000]
+                failures.append({
+                    "provider": name,
+                    "attempt": attempt,
+                    "error": message,
+                })
+
+                print(
+                    f"UPLOADER_FAIL: provider={name} "
+                    f"attempt={attempt}: {message}"
+                )
+
+    raise UploadError(
+        "All enabled uploader providers failed: "
+        + json.dumps(failures, ensure_ascii=False)
+    )

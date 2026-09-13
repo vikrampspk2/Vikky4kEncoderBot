@@ -1,0 +1,120 @@
+import json
+import os
+import subprocess
+from pathlib import Path
+from urllib.parse import quote
+
+
+class UploadError(Exception):
+    pass
+
+
+def upload_buzzheavier(path: str, token: str | None = None) -> str:
+    """
+    Buzzheavier PUT uploader.
+
+    Anonymous:
+      PUT https://w.buzzheavier.com/{filename}
+
+    Authenticated:
+      Authorization: Bearer ACCOUNT_ID
+    """
+    p = Path(path)
+
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise UploadError("Input file does not exist or is empty.")
+
+    url = "https://w.buzzheavier.com/" + quote(p.name)
+
+    cmd = [
+        "curl",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--retry", "2",
+        "--retry-delay", "3",
+        "--connect-timeout", "30",
+        "--max-time", "0",
+        "-T", str(p),
+    ]
+
+    if token:
+        cmd += ["-H", f"Authorization: Bearer {token}"]
+
+    cmd.append(url)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=None,
+        )
+    except FileNotFoundError:
+        raise UploadError("curl is not installed on the worker.")
+    except Exception as exc:
+        raise UploadError(f"Buzzheavier process error: {exc}")
+
+    if result.returncode != 0:
+        raise UploadError(
+            f"Buzzheavier upload failed: "
+            f"{result.stderr.strip()[-1000:]}"
+        )
+
+    output = result.stdout.strip()
+
+    if not output:
+        raise UploadError("Buzzheavier returned an empty response.")
+
+    # Buzzheavier normally returns a usable link. Do not invent one
+    # if the service returns an unexpected response.
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("http://") or line.startswith("https://"):
+            return line
+
+    # Buzzheavier returns JSON such as:
+    # {"code":201,"data":{"id":"5ppcdqs6hrnh","name":"file.mkv",...}}
+    # The public download page is based on the returned file ID.
+    try:
+        data = json.loads(output)
+
+        if isinstance(data, dict):
+            direct_keys = ("url", "download_url", "downloadUrl", "link")
+
+            for key in direct_keys:
+                value = data.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    return value
+
+            payload = data.get("data")
+            if isinstance(payload, dict):
+                for key in direct_keys:
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        return value
+
+                file_id = payload.get("id")
+                if isinstance(file_id, str) and file_id.strip():
+                    return "https://buzzheavier.com/" + quote(file_id.strip())
+
+    except Exception as exc:
+        print(f"BUZZHEAVIER_RESPONSE_PARSE_ERROR: {exc}")
+
+    raise UploadError(
+        "Buzzheavier upload completed but no usable download URL was returned."
+    )
+
+
+def upload_provider(provider: dict, path: str) -> str:
+    name = str(provider.get("name", "")).lower()
+    token_env = provider.get("token_env")
+    token = os.getenv(token_env) if token_env else None
+
+    if name == "buzzheavier":
+        return upload_buzzheavier(path, token)
+
+    raise UploadError(
+        f"No real adapter installed for provider '{name}'."
+    )
